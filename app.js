@@ -10,11 +10,65 @@ const LS_SYNC = "licai_ledger_sync_v1";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
+/* ---------- 机构识别 ----------
+   与云端 fetch_nav.py 的 ORG_ALIAS / detect_org() 严格对齐：
+   云端也是按「机构名 / 产品名 / 各类代码」里是否含简称来选抓取器，
+   所以前端的「能否自动抓净值」判定必须用同一套规则，否则会跟云端结论不一致。 */
+const ORG_ALIAS = [
+  ["北银", "bob"], ["北京银行", "bob"], ["bob", "bob"],
+  ["华夏", "hx"], ["hx", "hx"],
+  ["浦银", "spdb"], ["浦发", "spdb"], ["上海浦东发展", "spdb"], ["spdb", "spdb"]
+];
+const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财" };
+function detectOrg(p) {
+  if (!p) return "";
+  const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
+    .map(v => String(v == null ? "" : v)).join(" ").toLowerCase();
+  for (const [alias, code] of ORG_ALIAS) { if (hay.indexOf(alias) >= 0) return code; }
+  return "";
+}
+/* 仅凭「产品代码」形态推测机构——只用于输入时的实时提示。
+   权威判定始终以 detectOrg()（机构名/产品名）为准。
+   注：浦银官网接口实际按「登记编码」查询，未发现可靠的产品代码前缀规律，
+       故此处不臆造规则，改为提示用户填登记编码。 */
+const PRODCODE_RULES = [
+  [/^YJ\d{6,}[A-Z]?$/i, "bob", "北银产品代码：YJ + 数字（可带份额后缀字母）"],
+  [/^\d{12}$/, "hx", "华夏产品代码：12 位数字"]
+];
+function detectOrgByProdCode(code) {
+  const s = String(code == null ? "" : code).trim();
+  if (!s) return { org: "", tip: "" };
+  for (const [re, org, tip] of PRODCODE_RULES) { if (re.test(s)) return { org, tip }; }
+  if (/^Z\d{10,}$/i.test(s)) return { org: "", tip: "这看起来是「登记编码」，不是产品代码；请填到上方登记编码栏" };
+  return { org: "", tip: "" };
+}
+/* 云端抓取所需的产品代码（fetch_nav.py 的 get_prod_code：prodCode → code → shareCode） */
+function prodCodeOf(p) {
+  if (!p) return "";
+  for (const k of ["prodCode", "code", "shareCode"]) {
+    const v = String(p[k] == null ? "" : p[k]).trim();
+    if (v) return v;
+  }
+  return "";
+}
+/* 云端抓取就绪状态（与云端逻辑对齐，取最严格口径：必须填「产品代码」） */
+function fetchStatus(p) {
+  const code = String(p && p.prodCode || "").trim();
+  if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
+  const org = detectOrg(p);
+  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（名称或机构需含「北银/华夏/浦银」）" };
+  return { ok: true, lv: "ok", txt: `✓ 云端可自动抓净值（${ORG_NAME[org]}）` };
+}
+
 /* ---------- 数据 ---------- */
 /*
  data = {
    products: [{
-      id, code(登记编码), name, inst(机构), shareCode(销售代码),
+      id,
+      code(产品登记编码，Z/C 开头，用于中国理财网信披平台查询),
+      prodCode(产品代码，云端 fetch_nav.py 抓净值的依据),
+      name, inst(发行机构),
+      manager / riskLevel / orgName / estDate / benchmark(云端抓取后回填),
       navHistory: { "YYYY-MM-DD": navNumber },
       createdAt
    }],
@@ -68,6 +122,116 @@ function loadLocal() {
   } catch (e) { console.warn(e); }
 }
 function saveSync() { try { localStorage.setItem(LS_SYNC, JSON.stringify(SYNC)); } catch (e) { } }
+
+/* ============================================================
+   数据迁移与去重
+   ------------------------------------------------------------
+   背景（来自项目交接文档）：早期版本只有「销售代码」一栏，用户把云端抓
+   净值要用的「产品代码」错填在了那里；同时同一只产品被拆成了两条记录
+   （一条有交易记录、一条有云端净值），云端 fetch_nav.py 读到的是登记编码
+   而非产品代码，于是报「未取到净值」。
+
+   本函数做两件事：
+     1) shareCode → prodCode 搬迁
+     2) 同一产品的重复记录合并：净值取并集 / 交易改指 / 字段补全
+   返回是否发生了变更。
+   ============================================================ */
+/* 净值并集遇到同一日期不同取值时的策略：
+   true  = 取小数位更多的一方（更接近官方披露的精确值，如 1.011291 优于 1.0113）
+   false = 保留「保留方」的原有值（与云端「已有净值不覆盖」同口径） */
+const MIGRATE_PREFER_PRECISE_NAV = true;
+
+const MERGE_FIELDS = ["name", "inst", "code", "prodCode", "riskLevel", "manager", "orgName", "estDate", "benchmark", "lastNavSync"];
+
+function navCount(p) { return Object.keys((p && p.navHistory) || {}).length; }
+function hasTrade(p) { return DATA.trades.some(t => t.prodId === p.id); }
+/* 保留优先级：有交易 > 有净值 > 字段更全 > 创建更早（返回负值者胜出并被保留） */
+function mergeRank(a, b) {
+  const ta = hasTrade(a) ? 1 : 0, tb = hasTrade(b) ? 1 : 0;
+  if (ta !== tb) return tb - ta;
+  const na = navCount(a) > 0 ? 1 : 0, nb = navCount(b) > 0 ? 1 : 0;
+  if (na !== nb) return nb - na;
+  const fa = MERGE_FIELDS.filter(k => String(a[k] || "").trim()).length;
+  const fb = MERGE_FIELDS.filter(k => String(b[k] || "").trim()).length;
+  if (fa !== fb) return fb - fa;
+  return (a.createdAt || 0) - (b.createdAt || 0);
+}
+/* 判定两条记录是否同一产品：机构一致，且（登记编码相同 / 产品代码相同 / 名称互相包含） */
+function isSameProduct(a, b) {
+  const oa = detectOrg(a), ob = detectOrg(b);
+  if (!oa || oa !== ob) return false;
+  const ca = String(a.code || "").trim(), cb = String(b.code || "").trim();
+  if (ca && cb && ca.toUpperCase() === cb.toUpperCase()) return true;
+  const pa = String(a.prodCode || "").trim(), pb = String(b.prodCode || "").trim();
+  if (pa && pb && pa.toUpperCase() === pb.toUpperCase()) return true;
+  const na = String(a.name || "").trim(), nb = String(b.name || "").trim();
+  if (!na || !nb) return false;
+  const s = na.length <= nb.length ? na : nb;
+  const l = na.length <= nb.length ? nb : na;
+  /* 短名至少 8 字符且被长名完整包含，避免「7天」这类短名误合并 */
+  return s.length >= 8 && l.indexOf(s) >= 0;
+}
+/* 把 drop 并入 keep */
+function absorbProduct(keep, drop) {
+  keep.navHistory = keep.navHistory || {};
+  const dn = drop.navHistory || {};
+  for (const d of Object.keys(dn)) {
+    const cur = keep.navHistory[d];
+    if (cur === undefined || cur === null || cur === "") { keep.navHistory[d] = dn[d]; continue; }
+    if (MIGRATE_PREFER_PRECISE_NAV) {
+      const p1 = (String(cur).split(".")[1] || "").length;
+      const p2 = (String(dn[d]).split(".")[1] || "").length;
+      if (p2 > p1) keep.navHistory[d] = dn[d];
+    }
+  }
+  for (const t of DATA.trades) { if (t.prodId === drop.id) t.prodId = keep.id; }
+  for (const k of MERGE_FIELDS) {
+    if (!String(keep[k] || "").trim() && String(drop[k] || "").trim()) keep[k] = drop[k];
+  }
+  if (!keep.createdAt || (drop.createdAt && drop.createdAt < keep.createdAt)) keep.createdAt = drop.createdAt;
+}
+function migrateData() {
+  let changed = false; const logs = [];
+  /* 1) 销售代码 → 产品代码；旧字段一律清掉（含历史遗留的空串） */
+  for (const p of DATA.products) {
+    if (p.shareCode === undefined) continue;
+    const sc = String(p.shareCode || "").trim();
+    if (!String(p.prodCode || "").trim() && sc) {
+      p.prodCode = sc; changed = true;
+      logs.push(`「${p.name || p.code || p.id}」：销售代码 ${sc} 已搬迁为产品代码`);
+    }
+    const pc = String(p.prodCode || "").trim().toUpperCase();
+    if (!sc || pc === sc.toUpperCase()) { delete p.shareCode; changed = true; }
+  }
+  /* 2) 重复产品合并（列表在变，故命中后从头重扫，保证多对重复都能合并） */
+  outer: for (let i = 0; i < DATA.products.length; i++) {
+    for (let j = i + 1; j < DATA.products.length; j++) {
+      const a = DATA.products[i], b = DATA.products[j];
+      if (!a || !b || !isSameProduct(a, b)) continue;
+      const keep = mergeRank(a, b) <= 0 ? a : b;
+      const drop = keep === a ? b : a;
+      absorbProduct(keep, drop);
+      DATA.products = DATA.products.filter(x => x !== drop);
+      changed = true;
+      logs.push(`合并重复产品：「${drop.name || drop.id}」→「${keep.name || keep.id}」`);
+      i = -1; continue outer;
+    }
+  }
+  if (changed) { saveLocal(); UI.migrateLog = logs; }
+  return changed;
+}
+/* 迁移结果提示（不打断操作，细节打到控制台） */
+function notifyMigrate() {
+  const logs = UI.migrateLog || [];
+  if (!logs.length) return;
+  try { console.log("[migrate]\n" + logs.join("\n")); } catch (e) { }
+  const merged = logs.filter(s => s.indexOf("合并重复产品") === 0).length;
+  const moved = logs.length - merged;
+  const parts = [];
+  if (merged) parts.push(`合并重复产品 ${merged} 组`);
+  if (moved) parts.push(`搬迁产品代码 ${moved} 项`);
+  if (parts.length) toast("数据已自动整理：" + parts.join("、"), 4200);
+}
 
 /* ============================================================
    收益计算核心
@@ -395,11 +559,14 @@ function renderProd() {
     $("prodList").innerHTML = DATA.products.map(p => {
       const pos = position(p);
       const l = latestNav(p);
+      const st = fetchStatus(p);
       return `<div class="pick" style="cursor:default">
         <div class="p1">${esc(p.name)} <span class="wr" style="font-size:10.5px;color:var(--ink3)">${esc(p.inst || "")}</span></div>
-        <div class="p2">登记编码 ${esc(p.code || "-")} ${p.shareCode ? "· 销售代码 " + esc(p.shareCode) : ""}</div>
+        <div class="p2">登记编码 ${esc(p.code || "-")} · 产品代码 <b>${esc(p.prodCode || "-")}</b></div>
+        <div class="p2" style="color:${st.ok ? "#0d7a52" : "#8a6300"}">${st.txt}</div>
         <div class="p3">份额 ${pos.shares.toFixed(2)} · 成本 ${money(pos.cost)} · 市值 ${money(pos.market)} · 浮盈 <b class="${cls(pos.profit)}">${signMoney(pos.profit)}</b> · 净值 ${l ? l[1].toFixed(4) + " (" + l[0] + ")" : "无数据"}</div>
         <div class="row-btn" style="margin-top:8px">
+          <button class="mini" onclick="editProd('${p.id}')">编辑</button>
           <button class="mini" onclick="openNav('${p.id}')">录入/查看净值</button>
           <button class="mini" onclick="delProd('${p.id}')">删除</button>
         </div>
@@ -469,7 +636,7 @@ function openTrade(pickId) {
         <input id="tSearch" placeholder="搜索产品名称或代码" oninput="renderPick()">
       </div>
       <div id="pickBox" style="margin-top:8px;max-height:220px;overflow:auto"></div>
-      <button class="btn gh full" style="margin-top:8px" onclick="openProd(true)">+ 查不到？手动新增产品</button>
+      <button class="btn gh full" style="margin-top:8px" onclick="openProd()">+ 查不到？手动新增产品</button>
     </div>
     <div id="tFormBox"></div>`;
   openSheet(html);
@@ -477,14 +644,14 @@ function openTrade(pickId) {
 }
 function renderPick() {
   const kw = ($("tSearch") ? $("tSearch").value : "").trim().toLowerCase();
-  const list = DATA.products.filter(p => !kw || (p.name + p.code + (p.shareCode || "")).toLowerCase().includes(kw));
+  const list = DATA.products.filter(p => !kw || (p.name + p.code + (p.prodCode || "")).toLowerCase().includes(kw));
   const box = $("pickBox");
   if (!list.length) { box.innerHTML = `<div class="empty" style="padding:14px">没有匹配的产品</div>`; $("tFormBox").innerHTML = ""; return; }
   box.innerHTML = list.map(p => {
     const l = latestNav(p);
     return `<div class="pick ${UI.activePick === p.id ? "on" : ""}" onclick="pickProduct('${p.id}')">
       <div class="p1">${esc(p.name)}</div>
-      <div class="p2">${esc(p.inst || "")} ${p.shareCode ? "· 销售代码 " + esc(p.shareCode) : ""}</div>
+      <div class="p2">${esc(p.inst || "")}${p.prodCode ? " · 产品代码 " + esc(p.prodCode) : ""}</div>
       <div class="p3">登记编码 ${esc(p.code || "-")} · 最新净值 ${l ? l[1].toFixed(4) + "（" + l[0] + "）" : "无"}</div>
     </div>`;
   }).join("");
@@ -499,7 +666,7 @@ function renderTradeForm() {
   const lastNav = latestNav(p);
   const defNav = lastNav ? lastNav[1] : "";
   $("tFormBox").innerHTML = `
-    <div class="note b">当前操作产品：<b>${esc(p.name)}</b><br>${esc(p.inst || "")}${p.shareCode ? " · 销售代码 " + esc(p.shareCode) : ""}</div>
+    <div class="note b">当前操作产品：<b>${esc(p.name)}</b><br>${esc(p.inst || "")}${p.prodCode ? " · 产品代码 " + esc(p.prodCode) : ""}</div>
     <div class="field" style="margin-top:12px"><label>交易类型</label>
       <select id="tType" onchange="renderTradeForm2()">
         <option value="buy">买入</option><option value="sell">赎回</option>
@@ -592,22 +759,69 @@ function saveTrade() {
 /* ============================================================
    产品新增 / 净值录入
    ============================================================ */
-function openProd(fromTrade) {
-  openSheet(`<div class="sheet-t"><h3>添加产品</h3><button class="x" onclick="closeSheet()">✕</button></div>
-    <div class="note b" style="margin-bottom:12px">可按<b>登记编码</b>查询中国理财网并自动带出净值，也可手动录入。</div>
-    <div class="field"><label>产品登记编码</label>
-      <div class="actin"><input id="pCode" placeholder="如 Z7008926000006"><button class="btn pri" onclick="queryProduct()">查询</button></div>
-      <div class="tip">中国理财网信披平台的登记编码，形如 Z/C 开头</div>
+/* 产品表单：新增与编辑共用（pid 为空 = 新增） */
+function prodForm(pid) {
+  const p = pid ? DATA.products.find(x => x.id === pid) : null;
+  UI.editProdId = pid || "";
+  UI.queriedNav = null;
+  const meta = p && (p.manager || p.riskLevel)
+    ? `<div class="note" style="margin-bottom:12px">云端回填：${p.manager ? "管理人 " + esc(p.manager) : ""}${p.riskLevel ? " · 风险等级 " + esc(p.riskLevel) : ""}</div>` : "";
+  openSheet(`<div class="sheet-t"><h3>${p ? "编辑产品" : "添加产品"}</h3><button class="x" onclick="closeSheet()">✕</button></div>
+    <div class="note b" style="margin-bottom:12px">
+      净值由云端自动抓取，需要两个代码配合：<br>
+      ① <b>产品登记编码</b>（Z / C 开头）— 中国理财网信披平台查询用；<br>
+      ② <b>产品代码</b> — 云端抓净值的依据（北银如 <code>YJ01251204A</code>，华夏如 <code>208212400701</code>）。
+    </div>
+    <div class="field"><label>① 产品登记编码</label>
+      <div class="actin"><input id="pCode" placeholder="如 Z7008926000006" value="${esc(p && p.code || "")}"><button class="btn pri" onclick="queryProduct()">查询</button></div>
+      <div class="tip">中国理财网信披平台的登记编码，形如 Z / C 开头</div>
     </div>
     <div id="qResult"></div>
-    <div class="field"><label>产品名称 *</label><input id="pName" placeholder="必填"></div>
-    <div class="field"><label>发行机构</label><input id="pInst" placeholder="如 上海银行"></div>
-    <div class="field"><label>销售代码</label><input id="pShare" placeholder="选填"></div>
-    <div class="note" style="margin-bottom:12px">净值可不填，保存后在「产品」页用「录入净值」补；或点上方「查询」自动获取。</div>
+    <div class="field"><label>② 产品代码 <span class="muted">（云端抓净值依据，必填才能自动抓）</span></label>
+      <input id="pProd" placeholder="如 YJ01251204A" value="${esc(p && p.prodCode || "")}" oninput="onProdCodeInput()">
+      <div id="pProdTip" class="tip"></div>
+    </div>
+    <div class="field"><label>③ 产品名称 *（建议带机构简称）</label>
+      <input id="pName" placeholder="如 北银理财京华远见春系列诚享7天持有期29号理财产品" value="${esc(p && p.name || "")}" oninput="onProdCodeInput()">
+    </div>
+    <div class="field"><label>④ 发行机构</label>
+      <input id="pInst" placeholder="如 北银理财有限责任公司" value="${esc(p && p.inst || "")}" oninput="onProdCodeInput()">
+      <div class="tip">名称或机构里含「北银 / 华夏 / 浦银」简称，云端才能识别该用哪家官网接口</div>
+    </div>
+    ${meta}
+    <div class="note" style="margin-bottom:12px">历史净值可不填，保存后由云端抓取自动补全；也可在「产品」页用「录入/查看净值」手工补录。</div>
     <div class="row-btn">
       <button class="btn gh" style="flex:1" onclick="closeSheet()">取消</button>
-      <button class="btn pri" style="flex:1" onclick="saveProduct()">保存产品</button>
+      <button class="btn pri" style="flex:1" onclick="saveProduct('${pid || ""}')">${p ? "保存修改" : "保存产品"}</button>
     </div>`);
+  onProdCodeInput();
+}
+function openProd() { prodForm(""); }
+function editProd(pid) { prodForm(pid); }
+/* 产品代码输入时的实时机构识别提示 */
+function onProdCodeInput() {
+  const el = $("pProd"), tip = $("pProdTip");
+  if (!el || !tip) return;
+  const code = (el.value || "").trim();
+  const explicit = detectOrg({ inst: $("pInst") ? $("pInst").value : "", name: $("pName") ? $("pName").value : "" });
+  if (!code) {
+    tip.className = "tip";
+    tip.textContent = explicit ? `已按「${ORG_NAME[explicit]}」抓取，请补填产品代码` : "填产品代码后自动识别机构";
+    return;
+  }
+  const d = detectOrgByProdCode(code);
+  tip.className = "tip";
+  if (d.org) {
+    const clash = explicit && explicit !== d.org
+      ? ` <span style="color:var(--up)">⚠️ 但名称/机构指向 ${ORG_NAME[explicit]}，请核对</span>` : "";
+    tip.innerHTML = `识别为 <b>${ORG_NAME[d.org]}</b> ✓ · ${esc(d.tip)}${clash}`;
+  } else if (d.tip) {
+    tip.textContent = d.tip;
+  } else {
+    tip.textContent = explicit
+      ? `代码形态未识别，将按名称/机构判定的「${ORG_NAME[explicit]}」抓取`
+      : "代码形态未识别，请确保名称或发行机构含「北银 / 华夏 / 浦银」";
+  }
 }
 async function queryProduct() {
   const code = ($("pCode").value || "").trim();
@@ -645,24 +859,40 @@ async function queryProduct() {
       return;
     }
     $("pName").value = name; $("pInst").value = inst || "";
-    UI._queriedNav = navs;
+    UI.queriedNav = navs;
     const n = Object.keys(navs).length;
-    $("qResult").innerHTML = `<div class="note g">已识别：<b>${esc(name)}</b><br>净值 ${n} 条${n ? "（" + Object.keys(navs).sort()[0] + " ~ " + Object.keys(navs).sort().pop() + "）" : ""}</div>`;
+    $("qResult").innerHTML = `<div class="note g">已识别：<b>${esc(name)}</b><br>净值 ${n} 条${n ? "（" + Object.keys(navs).sort()[0] + " ~ " + Object.keys(navs).sort().pop() + "）" : ""}
+      <br><span style="font-size:11px">注意：信披平台只提供登记编码，云端自动抓净值还需另填 <b>产品代码</b>。</span></div>`;
+    onProdCodeInput();
   } catch (e) {
     $("qResult").innerHTML = `<div class="note">查询失败：${esc(String(e).slice(0, 80))}<br>可能是跨域限制或验证码。请手动填写。</div>`;
   }
 }
-function saveProduct() {
+function saveProduct(pid) {
   const name = ($("pName").value || "").trim();
   if (!name) return toast("产品名称必填");
-  const p = {
-    id: uid(), code: ($("pCode").value || "").trim(), name,
-    inst: ($("pInst").value || "").trim(), shareCode: ($("pShare").value || "").trim(),
-    navHistory: UI._queriedNav || {}, createdAt: Date.now()
+  const patch = {
+    code: ($("pCode").value || "").trim(),
+    prodCode: ($("pProd").value || "").trim(),
+    name,
+    inst: ($("pInst").value || "").trim()
   };
-  DATA.products.push(p); UI._queriedNav = null;
-  saveLocal(); closeSheet(); toast("产品已保存");
-  renderProd(); if (UI.activePick !== undefined) { UI.activePick = p.id; }
+  let target;
+  if (pid) {
+    target = DATA.products.find(x => x.id === pid);
+    if (!target) return toast("产品不存在，请刷新后重试");
+    Object.assign(target, patch);
+    if (UI.queriedNav) target.navHistory = Object.assign(target.navHistory || {}, UI.queriedNav);
+  } else {
+    target = Object.assign({ id: uid(), navHistory: UI.queriedNav || {}, createdAt: Date.now() }, patch);
+    DATA.products.push(target);
+    if (UI.activePick !== undefined) UI.activePick = target.id;
+  }
+  const st = fetchStatus(target);
+  UI.queriedNav = null; UI.editProdId = "";
+  saveLocal(); closeSheet();
+  toast((pid ? "产品已更新。" : "产品已保存。") + st.txt, st.ok ? 2200 : 3600);
+  renderProd(); renderHome();
   autoPush();
 }
 function openNav(pid) {
@@ -718,45 +948,39 @@ function delTrade(tid) {
 }
 
 /* ============================================================
-   净值更新（手动触发）
+   净值更新：改为「云端更新说明」弹层
+   ------------------------------------------------------------
+   原先这里的浏览器端 fetch 实际不可用 —— 中国理财网信披平台被 CORS 拦截，
+   点击后没有任何反应。净值改由云端 GitHub Actions 每天 08:00 / 12:00 抓取
+   并提交到私有仓库，浏览器端只需「从云端拉取」。
    ============================================================ */
-async function refreshNav() {
-  const btn = $("btnRefresh");
-  const prods = DATA.products.filter(p => p.code);
-  if (!prods.length) { toast("没有带登记编码的产品，请先添加或手动录入净值"); return; }
-  btn.disabled = true; btn.innerHTML = `<span class="spin"></span> 更新中`;
-  let okc = 0, fail = [];
-  for (const p of prods) {
-    try {
-      const r = await fetch(DETAIL_PAGE + encodeURIComponent(p.code));
-      const txt = await r.text();
-      const dom = new DOMParser().parseFromString(txt, "text/html");
-      let navs = {};
-      dom.querySelectorAll("table").forEach(tb => {
-        const ths = [...tb.querySelectorAll("th")].map(x => x.textContent.trim());
-        const di = ths.findIndex(x => x.includes("日期")), ni = ths.findIndex(x => x.includes("净值"));
-        if (di >= 0 && ni >= 0) {
-          tb.querySelectorAll("tbody tr").forEach(tr => {
-            const tds = tr.querySelectorAll("td");
-            if (tds.length > Math.max(di, ni)) {
-              const d = tds[di].textContent.trim().replace(/\//g, "-");
-              const v = Number(tds[ni].textContent.trim().replace(/,/g, ""));
-              if (/^\d{4}-\d{2}-\d{2}$/.test(d) && v > 0) navs[d] = v;
-            }
-          });
-        }
-      });
-      const n = Object.keys(navs).length;
-      if (n > 0) { p.navHistory = Object.assign(p.navHistory || {}, navs); okc++; }
-      else fail.push(p.name);
-    } catch (e) { fail.push(p.name); }
-    await new Promise(r => setTimeout(r, 800)); /* 低频，避免触发风控 */
-  }
-  saveLocal();
-  btn.disabled = false; btn.innerHTML = "⟳ 每日更新";
-  renderHome(); renderProd(); autoPush();
-  if (fail.length) toast(`更新完成：成功 ${okc} 只，失败 ${fail.length} 只（可能命中验证码，请手动补录）`, 3200);
-  else toast(`更新完成：${okc} 只产品净值已刷新`);
+function refreshNav() {
+  const last = (DATA.settings && DATA.settings.lastNavSync) || "";
+  const rows = DATA.products.map(p => {
+    const st = fetchStatus(p);
+    return `<div class="sumline" style="align-items:flex-start">
+      <span class="k" style="flex:1">${esc(p.name || p.id)}</span>
+      <b class="${st.ok ? "down" : "muted"}" style="font-size:10.5px;text-align:right;margin-left:8px">${esc(st.txt)}</b>
+    </div>`;
+  }).join("") || `<div class="empty">暂无产品</div>`;
+  const ready = DATA.products.filter(p => fetchStatus(p).ok).length;
+  openSheet(`<div class="sheet-t"><h3>净值更新说明</h3><button class="x" onclick="closeSheet()">✕</button></div>
+    <div class="note b" style="margin-bottom:12px">
+      净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 官网均设置了跨域限制（CORS），
+      页面直连会被浏览器拦截 —— 这正是原「每日更新」按钮点了没反应的原因。<br><br>
+      现在由云端 <b>GitHub Actions</b> 每天 <b>08:00 / 12:00</b> 自动抓取官方公开披露的净值，
+      提交到你的私有仓库；本页点「从云端拉取」即可同步到手机 / 电脑。
+    </div>
+    <div class="field"><label>云端最近一次抓取</label>
+      <div class="note ${last ? "g" : ""}">${last ? esc(last) : "暂无记录（云端抓取任务尚未写入）"}</div>
+    </div>
+    <div class="field"><label>各产品抓取就绪状态（${ready} / ${DATA.products.length} 可自动抓取）</label>
+      <div>${rows}<div class="tip" style="margin-top:6px">判定口径与云端抓取脚本一致：<b>机构可识别</b> + <b>已填产品代码</b>。标 ⚠️ 的产品请到「产品」页点「编辑」补填。</div></div>
+    </div>
+    <div class="row-btn" style="margin-top:14px">
+      <button class="btn gh" style="flex:1" onclick="closeSheet();go('pg-prod')">去产品页</button>
+      <button class="btn pri" style="flex:1" onclick="closeSheet();syncPull(true)">↓ 从云端拉取</button>
+    </div>`);
 }
 
 /* ============================================================
@@ -824,8 +1048,13 @@ async function syncPull(manual) {
     const remote = JSON.parse(decodeURIComponent(escape(atob(info.content.replace(/\n/g, "")))));
     if (manual && !confirm("用云端数据覆盖本地？本地未同步的改动将丢失。\n建议：先在另一台设备推送，或先导出本地备份。")) return;
     DATA = Object.assign({ products: [], trades: [], settings: {} }, remote);
-    saveLocal(); renderHome(); renderTrade(); renderProd(); renderSet();
-    if (manual) toast("已从云端拉取");
+    saveLocal();
+    /* 云端数据同样要过一遍迁移：合并重复产品、搬迁销售代码。
+       若发生变更则回写云端 —— 抓取脚本读到正确的产品代码后才会抓到净值。 */
+    const migratedRemote = migrateData();
+    renderHome(); renderTrade(); renderProd(); renderSet();
+    if (migratedRemote) { notifyMigrate(); autoPush(); }
+    if (manual) toast(migratedRemote ? "已从云端拉取，并自动整理数据" : "已从云端拉取");
   } catch (e) {
     if (manual) toast("拉取失败：" + String(e).slice(0, 80), 3000);
   }
@@ -895,8 +1124,11 @@ function clearAll() {
    ============================================================ */
 (function init() {
   loadLocal();
+  /* 启动即做一次数据迁移：销售代码→产品代码、重复产品合并 */
+  const migrated = migrateData();
   $("btnHide").textContent = DATA.settings.hideAmount ? "显示" : "隐藏";
   renderHome(); renderSet();
+  if (migrated) notifyMigrate();
   if (SYNC.owner && SYNC.repo && SYNC.token) syncPull(false);
   window.addEventListener("online", () => { if (SYNC.owner) syncPull(false); });
   /* 注册 Service Worker（仅 https / localhost 生效，file:// 下自动跳过） */
