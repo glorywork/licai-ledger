@@ -21,9 +21,13 @@ const ORG_ALIAS = [
   /* 信银理财：云端 ORG_ALIAS 里「信银理财 / 信银 / 中信 / citic」四项，
      前端必须一字不差地同序排列，否则前后端对同一产品会给出不同结论。
      注意「中信」是或关系的子串匹配，机构栏写「中信银行」也会判为信银。 */
-  ["信银理财", "citic"], ["信银", "citic"], ["中信", "citic"], ["citic", "citic"]
+  ["信银理财", "citic"], ["信银", "citic"], ["中信", "citic"], ["citic", "citic"],
+  /* 南银 / 民生：与云端 ORG_ALIAS 末尾四/三项同序同构（2026-09-12 接入）。 */
+  ["南银理财", "nanyin"], ["南银", "nanyin"], ["nanyin", "nanyin"],
+  ["民生理财", "cmbc"], ["民生", "cmbc"], ["cmbc", "cmbc"]
 ];
-const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财" };
+const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
+                   nanyin: "南银理财", cmbc: "民生理财" };
 function detectOrg(p) {
   if (!p) return "";
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
@@ -45,7 +49,13 @@ const PRODCODE_RULES = [
   /* 信银「母产品代码」：AF/AM/BF/BB + 6 位数字，缺了末位份额字母。
      信银官网只认 9 位份额代码，8 位母代码一律返回「未查询到该产品信息」，
      所以这里必须单独提醒补全，否则用户会以为云端抓取坏了。 */
-  [/^(?:AF|AM|BF|BB)\d{6}$/i, "citic", "⚠️ 这像是信银的母产品代码（缺末位份额字母），必须补上份额字母才能查到净值"]
+  [/^(?:AF|AM|BF|BB)\d{6}$/i, "citic", "⚠️ 这像是信银的母产品代码（缺末位份额字母），必须补上份额字母才能查到净值"],
+  /* 南银：10 位销售代码 NYYW + 6 位数字，如 NYYW000016。
+     官网加密接口只认销售代码，登记编码（Z 开头）可由云端自动反查补齐。 */
+  [/^NYYW\d{6}$/i, "nanyin", "南银销售代码：NYYW + 6 位数字（如 NYYW000016）"],
+  /* 民生：10 位产品代码 F + 3 位字母 + 5 位数字 + 份额字母，如 FBAG65601C。
+     实测全集前缀 FBAG/FBAE/FBAF/FSAE/FSAF/FSAG/FGAE/FGAG/FGAF；登记编码查询 0 命中。 */
+  [/^F[A-Z]{3}\d{5}[A-Z]$/i, "cmbc", "民生产品代码：F + 3 位字母 + 5 位数字 + 份额字母（如 FBAG65601C）"]
 ];
 function detectOrgByProdCode(code) {
   const s = String(code == null ? "" : code).trim();
@@ -68,7 +78,7 @@ function fetchStatus(p) {
   const code = String(p && p.prodCode || "").trim();
   if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
   const org = detectOrg(p);
-  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（名称或机构需含「北银/华夏/浦银/信银」）" };
+  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（名称或机构需含「北银/华夏/浦银/信银/南银/民生」）" };
   return { ok: true, lv: "ok", txt: `✓ 云端可自动抓净值（${ORG_NAME[org]}）` };
 }
 
@@ -782,7 +792,7 @@ function prodForm(pid) {
     <div class="note b" style="margin-bottom:12px">
       净值由云端自动抓取，需要两个代码配合：<br>
       ① <b>产品登记编码</b>（Z / C 开头）— 中国理财网信披平台查询用；<br>
-      ② <b>产品代码</b> — 云端抓净值的依据（北银如 <code>YJ01251204A</code>，华夏如 <code>208212400701</code>，信银如 <code>AF251387C</code>）。信银要填<b>完整的份额代码</b>（含末位份额字母），去掉末位字母查不到。
+      ② <b>产品代码</b> — 云端抓净值的依据（北银如 <code>YJ01251204A</code>，华夏如 <code>208212400701</code>，信银如 <code>AF251387C</code>，南银如 <code>NYYW000016</code>，民生如 <code>FBAG65601C</code>）。信银要填<b>完整的份额代码</b>（含末位份额字母），去掉末位字母查不到。
     </div>
     <div class="field"><label>① 产品登记编码</label>
       <div class="actin"><input id="pCode" placeholder="如 Z7008926000006" value="${esc(p && p.code || "")}"><button class="btn pri" onclick="queryProduct()">查询</button></div>
@@ -978,7 +988,7 @@ function refreshNav() {
   const ready = DATA.products.filter(p => fetchStatus(p).ok).length;
   openSheet(`<div class="sheet-t"><h3>净值更新说明</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="note b" style="margin-bottom:12px">
-      净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 / 信银 官网均设置了跨域限制（CORS），
+      净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 / 信银 / 南银 / 民生 官网均设置了跨域限制（CORS）或加密/风控，
       页面直连会被浏览器拦截 —— 这正是原「每日更新」按钮点了没反应的原因。<br><br>
       现在由云端 <b>GitHub Actions</b> 每天 <b>08:00 / 12:00</b> 自动抓取官方公开披露的净值，
       提交到你的私有仓库；本页点「从云端拉取」即可同步到手机 / 电脑。
