@@ -24,10 +24,14 @@ const ORG_ALIAS = [
   ["信银理财", "citic"], ["信银", "citic"], ["中信", "citic"], ["citic", "citic"],
   /* 南银 / 民生：与云端 ORG_ALIAS 末尾四/三项同序同构（2026-09-12 接入）。 */
   ["南银理财", "nanyin"], ["南银", "nanyin"], ["nanyin", "nanyin"],
-  ["民生理财", "cmbc"], ["民生", "cmbc"], ["cmbc", "cmbc"]
+  ["民生理财", "cmbc"], ["民生", "cmbc"], ["cmbc", "cmbc"],
+  /* 宁银（宁波银行理财）：官网净值表可服务端直抓（2026-09-13 接入），
+     与云端 ORG_ALIAS 末尾三项同序同构。注意「宁银」≠「南银」。 */
+  ["宁银理财", "wmbnb"], ["宁银", "wmbnb"], ["wmbnb", "wmbnb"]
 ];
 const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
-                   nanyin: "南银理财", cmbc: "民生理财", chinawealth: "中国理财网" };
+                   nanyin: "南银理财", cmbc: "民生理财", wmbnb: "宁银理财",
+                   chinawealth: "中国理财网" };
 function detectOrg(p) {
   if (!p) return "";
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
@@ -63,7 +67,9 @@ const PRODCODE_RULES = [
   [/^NYYW\d{6}$/i, "nanyin", "南银销售代码：NYYW + 6 位数字（如 NYYW000016）"],
   /* 民生：10 位产品代码 F + 3 位字母 + 5 位数字 + 份额字母，如 FBAG65601C。
      实测全集前缀 FBAG/FBAE/FBAF/FSAE/FSAF/FSAG/FGAE/FGAG/FGAF；登记编码查询 0 命中。 */
-  [/^F[A-Z]{3}\d{5}[A-Z]$/i, "cmbc", "民生产品代码：F + 3 位字母 + 5 位数字 + 份额字母（如 FBAG65601C）"]
+  [/^F[A-Z]{3}\d{5}[A-Z]$/i, "cmbc", "民生产品代码：F + 3 位字母 + 5 位数字 + 份额字母（如 FBAG65601C）"],
+  /* 宁银：Z + 2 位字母 + 7 位数字 + 份额字母，如 ZGN2360006C。官网净值表按此份额代码查询。 */
+  [/^Z[A-Z]{2}\d{7}[A-Z]$/i, "wmbnb", "宁银产品代码：Z + 2 位字母 + 7 位数字 + 份额字母（如 ZGN2360006C）"]
 ];
 function detectOrgByProdCode(code) {
   const s = String(code == null ? "" : code).trim();
