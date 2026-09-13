@@ -94,10 +94,15 @@ function fetchStatus(p) {
   const org = detectOrg(p);
   if (org === "chinawealth") {
     const reg = String(p && p.regCode || p && p.code || "").trim().toUpperCase();
-    if (!/^Z\d{12,14}$/.test(reg)) {
-      return { ok: false, lv: "warn", txt: "⚠️ 中国理财网查询需填登记编码（Z 开头），或填产品名称" };
+    const hasName = !!(p && p.name && String(p.name).trim());
+    /* 云端 fetch_chinawealth 支持「登记编码 或 产品名称」两种查询键，
+       名称含发行方全称（如广银理财…）时按名称搜索即可，不必强制 Z 编码。 */
+    const hasReg = /^Z\d{12,14}$/.test(reg);
+    if (!hasReg && !hasName) {
+      return { ok: false, lv: "warn", txt: "⚠️ 中国理财网查询需填登记编码（Z 开头）或完整产品名称" };
     }
-    return { ok: true, lv: "ok", txt: "✓ 云端可自动抓最新净值（中国理财网·按登记编码）" };
+    const via = hasReg ? "按登记编码" : "按产品名称";
+    return { ok: true, lv: "ok", txt: `✓ 云端可自动抓最新净值（中国理财网·${via}）` };
   }
   if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
   if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（机构栏填理财公司全名如「招银理财/工银理财」，或填 Z 开头登记编码走中国理财网）" };
@@ -830,7 +835,7 @@ function prodForm(pid) {
     </div>
     <div class="field"><label>④ 发行机构</label>
       <input id="pInst" placeholder="如 北银理财有限责任公司" value="${esc(p && p.inst || "")}" oninput="onProdCodeInput()">
-      <div class="tip">名称或机构里含「北银 / 华夏 / 浦银」简称，云端才能识别该用哪家官网接口</div>
+      <div class="tip">发行方（如「广银理财」「北银理财」）或完整产品名含「理财」即可自动识别；代销银行（微众/招行等）不影响，识别依据是发行方与产品名</div>
     </div>
     ${meta}
     <div class="note" style="margin-bottom:12px">历史净值可不填，保存后由云端抓取自动补全；也可在「产品」页用「录入/查看净值」手工补录。</div>
@@ -864,7 +869,7 @@ function onProdCodeInput() {
   } else {
     tip.textContent = explicit
       ? `代码形态未识别，将按名称/机构判定的「${ORG_NAME[explicit]}」抓取`
-      : "代码形态未识别，请确保名称或发行机构含「北银 / 华夏 / 浦银」";
+      : "代码形态未识别，请填完整产品名（含发行方，如「广银理财…」）或 Z 开头登记编码";
   }
 }
 async function queryProduct() {
