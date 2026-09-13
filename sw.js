@@ -1,6 +1,6 @@
 /* 个人理财台账 Service Worker
    外壳缓存优先；数据由 GitHub 同步，不走缓存 */
-const CACHE = "licai-ledger-v5";
+const CACHE = "licai-ledger-v6";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
