@@ -27,12 +27,17 @@ const ORG_ALIAS = [
   ["民生理财", "cmbc"], ["民生", "cmbc"], ["cmbc", "cmbc"]
 ];
 const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
-                   nanyin: "南银理财", cmbc: "民生理财" };
+                   nanyin: "南银理财", cmbc: "民生理财", chinawealth: "中国理财网" };
 function detectOrg(p) {
   if (!p) return "";
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
     .map(v => String(v == null ? "" : v)).join(" ").toLowerCase();
   for (const [alias, code] of ORG_ALIAS) { if (hay.indexOf(alias) >= 0) return code; }
+  /* 兜底（与云端 detect_org 末尾同构）：机构未识别但登记编码 Z 开头
+     （Z+12~14 位数字）→ 中国理财网通用聚合源（覆盖全部发行方）。 */
+  const reg = String(p.regCode || p.zcode || p.instCode || p.shareCode || p.code || "")
+    .trim().toUpperCase();
+  if (/^Z\d{12,14}$/.test(reg)) return "chinawealth";
   return "";
 }
 /* 仅凭「产品代码」形态推测机构——只用于输入时的实时提示。
@@ -61,7 +66,7 @@ function detectOrgByProdCode(code) {
   const s = String(code == null ? "" : code).trim();
   if (!s) return { org: "", tip: "" };
   for (const [re, org, tip] of PRODCODE_RULES) { if (re.test(s)) return { org, tip }; }
-  if (/^Z\d{10,}$/i.test(s)) return { org: "", tip: "这看起来是「登记编码」，不是产品代码；请填到上方登记编码栏" };
+  if (/^Z\d{10,}$/i.test(s)) return { org: "", tip: "这看起来是「登记编码」——请填到上方登记编码栏；填好后云端会走中国理财网通用查询（覆盖全部发行方）" };
   return { org: "", tip: "" };
 }
 /* 云端抓取所需的产品代码（fetch_nav.py 的 get_prod_code：prodCode → code → shareCode） */
@@ -73,12 +78,20 @@ function prodCodeOf(p) {
   }
   return "";
 }
-/* 云端抓取就绪状态（与云端逻辑对齐，取最严格口径：必须填「产品代码」） */
+/* 云端抓取就绪状态（与云端逻辑对齐）：
+   常规机构：必须填「产品代码」；中国理财网聚合源：凭登记编码（Z 开头）即可查询。 */
 function fetchStatus(p) {
   const code = String(p && p.prodCode || "").trim();
-  if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
   const org = detectOrg(p);
-  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（名称或机构需含「北银/华夏/浦银/信银/南银/民生」）" };
+  if (org === "chinawealth") {
+    const reg = String(p && p.regCode || p && p.code || "").trim().toUpperCase();
+    if (!/^Z\d{12,14}$/.test(reg)) {
+      return { ok: false, lv: "warn", txt: "⚠️ 中国理财网查询需填登记编码（Z 开头），或填产品名称" };
+    }
+    return { ok: true, lv: "ok", txt: "✓ 云端可自动抓最新净值（中国理财网·按登记编码）" };
+  }
+  if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
+  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（名称或机构需含「北银/华夏/浦银/信银/南银/民生」，或填 Z 开头登记编码走中国理财网）" };
   return { ok: true, lv: "ok", txt: `✓ 云端可自动抓净值（${ORG_NAME[org]}）` };
 }
 
