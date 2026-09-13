@@ -33,8 +33,11 @@ function detectOrg(p) {
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
     .map(v => String(v == null ? "" : v)).join(" ").toLowerCase();
   for (const [alias, code] of ORG_ALIAS) { if (hay.indexOf(alias) >= 0) return code; }
-  /* 兜底（与云端 detect_org 末尾同构）：机构未识别但登记编码 Z 开头
-     （Z+12~14 位数字）→ 中国理财网通用聚合源（覆盖全部发行方）。 */
+  /* 通用规则（与云端 detect_org 同构）：名称/机构含「理财」→ 中国理财网通用
+     聚合源（覆盖招银/工银/中银/交银/宁银/苏银等全部 32 家发行方）。
+     已接入机构在 ORG_ALIAS 里优先命中，走各自官网抓取器（历史更全）。 */
+  if (hay.indexOf("理财") >= 0) return "chinawealth";
+  /* 兜底（与云端同构）：机构未识别但登记编码 Z 开头（Z+12~14 位数字）。 */
   const reg = String(p.regCode || p.zcode || p.instCode || p.shareCode || p.code || "")
     .trim().toUpperCase();
   if (/^Z\d{12,14}$/.test(reg)) return "chinawealth";
@@ -91,7 +94,7 @@ function fetchStatus(p) {
     return { ok: true, lv: "ok", txt: "✓ 云端可自动抓最新净值（中国理财网·按登记编码）" };
   }
   if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
-  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（名称或机构需含「北银/华夏/浦银/信银/南银/民生」，或填 Z 开头登记编码走中国理财网）" };
+  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（机构栏填理财公司全名如「招银理财/工银理财」，或填 Z 开头登记编码走中国理财网）" };
   return { ok: true, lv: "ok", txt: `✓ 云端可自动抓净值（${ORG_NAME[org]}）` };
 }
 
