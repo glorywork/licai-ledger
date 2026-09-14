@@ -10,7 +10,7 @@ const LS_SYNC = "licai_ledger_sync_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v13";
+const APP_VER = "v14";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -145,7 +145,13 @@ const pad = n => String(n).padStart(2, "0");
 const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const parseDate = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
 const today = () => fmtDate(new Date());
-const money = n => (Math.abs(n) < 0.005 ? 0 : n).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/* 金额格式化。
+   ⚠️ 必须先把入参转成数字：历史数据或手工改过的 licai-data.json 里 amount 可能是
+   undefined/null，直接 .toLocaleString 会抛异常并把整个列表渲染打断（页面白屏）。 */
+const money = n => {
+  const v = Number(n) || 0;
+  return (Math.abs(v) < 0.005 ? 0 : v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
 const signMoney = n => (n > 0 ? "+" : n < 0 ? "-" : "") + money(Math.abs(n));
 const pct = n => (n * 100).toFixed(2) + "%";
 const cls = n => n > 0 ? "up" : n < 0 ? "down" : "muted";
@@ -521,6 +527,9 @@ function renderHome() {
   setStat("statM1r", annualize(mNow, y, m), false, true);
   setStat("statM0r", annualize(mPrev, mPrevYear, mPrevMonth), false, true);
   setStat("statReal", pf.totalRealized, true);
+  /* 口径透明化：把「这笔钱是怎么算出来的」写在数字旁边，避免误读成官方数字 */
+  const sellsN = DATA.trades.filter(t => t.type === "sell").length;
+  if ($("statRealCap")) $("statRealCap").textContent = `赎回结算 · 均价法扣减成本 · 已核算 ${sellsN} 笔赎回`;
   $("statCnt").textContent = pf.rows.length; $("statCnt").className = "v";
   if ($("appVer")) $("appVer").textContent = `版本 ${APP_VER}`;
   renderCal(); renderDetail();
@@ -812,10 +821,10 @@ function renderDetailBody() {
         <div class="pk">
           <i>持有金额 <b>${DATA.settings.hideAmount ? "****" : money(x.pos.market)}</b></i>
           <i>当日盈亏 <b class="${cls(x.dayP)}">${signMoney(x.dayP)}</b></i>
-          <i>持仓盈亏 <b class="${cls(x.pos.profit)}">${signMoney(x.pos.profit)}</b></i>
-          <i>持有年化 ${annualTxt}</i>
+          <i>持仓盈亏 <b class="${cls(x.pos.profit)}">${signMoney(x.pos.profit)}</b>（市值−成本）</i>
+          <i>持有年化 ${annualTxt}（本金天数加权）</i>
           <i>持有 <b>${x.pos.holdDays}天</b></i>
-          <i>净值 <b>${x.pos.lastNav.toFixed(4)}</b></i>
+          <i>净值 <b>${x.pos.lastNav.toFixed(4)}</b>${x.pos.lastDate ? "（" + esc(x.pos.lastDate.slice(5)) + "）" : ""}</i>
         </div>
       </div>`;
     }
@@ -860,7 +869,7 @@ function renderTrade() {
       const p = DATA.products.find(x => x.id === t.prodId);
       return `<div class="sumline"><span class="k">${esc(p ? prodLabel(p) : "-")} <span class="muted" style="font-size:11px">${t.tradeDate}</span></span>
         <b class="${cls(t.realized)}">${signMoney(t.realized)}</b></div>`;
-    }).join("") + `<div class="sumline"><span class="k">合计已实现</span><b class="${cls(tot)}">${signMoney(tot)}</b></div>`;
+    }).join("") + `<div class="sumline"><span class="k">合计已实现 <span class="muted" style="font-size:10.5px">均价法扣减成本 · 已核算 ${sells.length} 笔赎回</span></span><b class="${cls(tot)}">${signMoney(tot)}</b></div>`;
   }
 }
 
@@ -1544,20 +1553,21 @@ function renderProdDetail() {
     </div>
 
     <div class="grid2" style="margin-top:12px">
-      <div class="stat"><div class="l">最新净值${latestDate ? "（" + esc(latestDate.slice(5)) + "）" : ""}</div><div class="v" style="color:var(--brand)">${navFmt(latest)}</div></div>
-      <div class="stat"><div class="l">万份收益（最新）</div><div class="v ${cls(wan === null ? 0 : wan)}">${wan === null ? "—" : signMoney(wan)}</div></div>
-      <div class="stat"><div class="l">近7日年化</div><div class="v ${cls(a7 === null ? 0 : a7)}">${pctFmt(a7)}</div></div>
-      <div class="stat"><div class="l">近14日年化</div><div class="v ${cls(a14 === null ? 0 : a14)}">${pctFmt(a14)}</div></div>
-      <div class="stat"><div class="l">近1月年化</div><div class="v ${cls(a30 === null ? 0 : a30)}">${pctFmt(a30)}</div></div>
-      <div class="stat"><div class="l">成立以来年化</div><div class="v ${cls(since === null ? 0 : since)}">${pctFmt(since)}</div></div>
+      <div class="stat"><div class="l">最新净值${latestDate ? "（" + esc(latestDate.slice(5)) + "）" : ""}</div><div class="v" style="color:var(--brand)">${navFmt(latest)}</div><div class="cap">官方披露的份额净值</div></div>
+      <div class="stat"><div class="l">万份收益（最新）</div><div class="v ${cls(wan === null ? 0 : wan)}">${wan === null ? "—" : signMoney(wan)}</div><div class="cap">(今 − 昨) × 10000</div></div>
+      <div class="stat"><div class="l">近7日年化</div><div class="v ${cls(a7 === null ? 0 : a7)}">${pctFmt(a7)}</div><div class="cap">7 日净值变动折算年化</div></div>
+      <div class="stat"><div class="l">近14日年化</div><div class="v ${cls(a14 === null ? 0 : a14)}">${pctFmt(a14)}</div><div class="cap">14 日折算</div></div>
+      <div class="stat"><div class="l">近1月年化</div><div class="v ${cls(a30 === null ? 0 : a30)}">${pctFmt(a30)}</div><div class="cap">30 日折算</div></div>
+      <div class="stat"><div class="l">成立以来年化</div><div class="v ${cls(since === null ? 0 : since)}">${pctFmt(since)}</div><div class="cap">首末净值折算 · 全周期</div></div>
     </div>
+    <div class="cap" style="padding:6px 0 0">样本不足时显示「—」，不估算、不补齐；净值型产品官方不披露万份收益与年化，以上均为本工具折算口径。</div>
 
     ${pos.shares > 0 ? `<div class="card-t" style="margin:14px 0 8px"><h2 style="font-size:14px">我的持仓</h2></div>
     <div class="grid2">
-      <div class="stat"><div class="l">持有金额</div><div class="v">${DATA.settings.hideAmount ? "****" : money(pos.market)}</div></div>
-      <div class="stat"><div class="l">持仓收益</div><div class="v ${cls(pos.profit)}">${signMoney(pos.profit)}</div></div>
-      <div class="stat"><div class="l">持仓份额</div><div class="v" style="font-size:15px">${pos.shares.toFixed(2)}</div></div>
-      <div class="stat"><div class="l">成本净值</div><div class="v" style="font-size:15px">${pos.shares > 0 ? (pos.cost / pos.shares).toFixed(4) : "—"}</div></div>
+      <div class="stat"><div class="l">持有金额</div><div class="v">${DATA.settings.hideAmount ? "****" : money(pos.market)}</div><div class="cap">已确认份额 × 最新净值</div></div>
+      <div class="stat"><div class="l">持仓收益</div><div class="v ${cls(pos.profit)}">${signMoney(pos.profit)}</div><div class="cap">市值 − 持仓成本</div></div>
+      <div class="stat"><div class="l">持仓份额</div><div class="v" style="font-size:15px">${pos.shares.toFixed(2)}</div><div class="cap">已确认份额，不含在途</div></div>
+      <div class="stat"><div class="l">成本净值</div><div class="v" style="font-size:15px">${pos.shares > 0 ? (pos.cost / pos.shares).toFixed(4) : "—"}</div><div class="cap">买入金额合计 ÷ 份额</div></div>
     </div>` : ""}
 
     <div class="card-t" style="margin:16px 0 8px"><h2 style="font-size:14px">净值走势</h2></div>
