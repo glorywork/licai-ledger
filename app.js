@@ -10,7 +10,7 @@ const LS_SYNC = "licai_ledger_sync_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v10";
+const APP_VER = "v11";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -600,7 +600,7 @@ function pendingHtml(list) {
   return list.map(({ p, pos }) => `<div class="grp">
     <div class="grp-h">
       <div class="av">${esc(String(p.inst || p.name || "?").slice(0, 1))}</div>
-      <div class="nm">${esc(p.name)}<span class="state-chip">交易在途</span></div>
+      <div class="nm">${esc(prodLabel(p))}<span class="state-chip">交易在途</span></div>
       <div class="amt muted">待确认</div>
     </div>
     <div class="prow transit">
@@ -623,7 +623,7 @@ function closedHtml(list) {
     return `<div class="grp">
     <div class="grp-h">
       <div class="av">${esc(String(p.inst || p.name || "?").slice(0, 1))}</div>
-      <div class="nm">${esc(p.name)}<span class="state-chip closed">已清仓</span></div>
+      <div class="nm">${esc(prodLabel(p))}<span class="state-chip closed">已清仓</span></div>
       <div class="amt ${cls(pos.realized)}">${signMoney(pos.realized)}</div>
     </div>
     <div class="prow">
@@ -694,7 +694,7 @@ function renderDetail() {
         ? `<b class="${cls(x.pos.holdAnnual)}">${pct(x.pos.holdAnnual)}</b>`
         : `<b class="muted">持有不足7天</b>`;
       html += `<div class="prow">
-        <div class="pn">${esc(x.r.p.name)}</div>
+        <div class="pn">${esc(prodLabel(x.r.p))}</div>
         <div class="pv ${cls(x.dayP)}">${signMoney(x.dayP)}</div>
         <div class="pk">
           <i>持有金额 <b>${DATA.settings.hideAmount ? "****" : money(x.pos.market)}</b></i>
@@ -723,7 +723,7 @@ function renderTrade() {
       const isBuy = t.type === "buy";
       return `<div class="sumline" style="align-items:flex-start">
         <div style="flex:1">
-          <div style="font-weight:650;font-size:12.5px">${esc(p ? p.name : "已删除产品")}
+          <div style="font-weight:650;font-size:12.5px">${esc(p ? prodLabel(p) : "已删除产品")}
             <span class="wr" style="font-size:10.5px;padding:2px 6px;border-radius:5px;background:${isBuy ? '#e9f7f1' : '#fdeff0'};color:${isBuy ? '#0d7a52' : '#c02a34'};margin-left:4px">${isBuy ? "买入" : "赎回"}</span>
           </div>
           <div style="font-size:11px;color:var(--ink2);margin-top:3px">
@@ -745,7 +745,7 @@ function renderTrade() {
     const tot = sells.reduce((s, t) => s + (Number(t.realized) || 0), 0);
     $("realList").innerHTML = sells.map(t => {
       const p = DATA.products.find(x => x.id === t.prodId);
-      return `<div class="sumline"><span class="k">${esc(p ? p.name : "-")} <span class="muted" style="font-size:11px">${t.tradeDate}</span></span>
+      return `<div class="sumline"><span class="k">${esc(p ? prodLabel(p) : "-")} <span class="muted" style="font-size:11px">${t.tradeDate}</span></span>
         <b class="${cls(t.realized)}">${signMoney(t.realized)}</b></div>`;
     }).join("") + `<div class="sumline"><span class="k">合计已实现</span><b class="${cls(tot)}">${signMoney(tot)}</b></div>`;
   }
@@ -759,7 +759,7 @@ function renderProd() {
       const l = latestNav(p);
       const st = fetchStatus(p);
       return `<div class="pick" style="cursor:default">
-        <div class="p1">${esc(p.name)} <span class="wr" style="font-size:10.5px;color:var(--ink3)">${esc(p.inst || "")}</span></div>
+        <div class="p1">${esc(prodLabel(p))} <span class="wr" style="font-size:10.5px;color:var(--ink3)">${esc(p.inst || "")}</span></div>
         <div class="p2">登记编码 ${esc(p.code || "-")} · 产品代码 <b>${esc(p.prodCode || "-")}</b></div>
         <div class="p2" style="color:${st.ok ? "#0d7a52" : "#8a6300"}">${st.txt}</div>
         <div class="p3">份额 ${pos.shares.toFixed(2)} · 成本 ${money(pos.cost)} · 市值 ${money(pos.market)} · 浮盈 <b class="${cls(pos.profit)}">${signMoney(pos.profit)}</b> · 净值 ${l ? l[1].toFixed(4) + " (" + l[0] + ")" : "无数据"}</div>
@@ -775,7 +775,7 @@ function renderProd() {
     const s = navSeries(p);
     const recent = s.slice(-5).reverse();
     return `<div style="margin-bottom:12px">
-      <div style="font-size:12.5px;font-weight:650;margin-bottom:5px">${esc(p.name)} <span class="muted" style="font-size:11px">共 ${s.length} 条</span></div>
+      <div style="font-size:12.5px;font-weight:650;margin-bottom:5px">${esc(prodLabel(p))} <span class="muted" style="font-size:11px">共 ${s.length} 条</span></div>
       ${recent.length ? recent.map(([d, v]) => `<span style="display:inline-block;font-size:11px;background:var(--bg);border-radius:6px;padding:3px 8px;margin:0 5px 5px 0">${d.slice(5)} <b>${Number(v).toFixed(4)}</b></span>`).join("") : `<span class="muted" style="font-size:11px">暂无净值</span>`}
     </div>`;
   }).join("") || `<div class="empty">暂无产品</div>`;
@@ -848,7 +848,7 @@ function renderPick() {
   box.innerHTML = list.map(p => {
     const l = latestNav(p);
     return `<div class="pick ${UI.activePick === p.id ? "on" : ""}" onclick="pickProduct('${p.id}')">
-      <div class="p1">${esc(p.name)}</div>
+      <div class="p1">${esc(prodLabel(p))}</div>
       <div class="p2">${esc(p.inst || "")}${p.prodCode ? " · 产品代码 " + esc(p.prodCode) : ""}</div>
       <div class="p3">登记编码 ${esc(p.code || "-")} · 最新净值 ${l ? l[1].toFixed(4) + "（" + l[0] + "）" : "无"}</div>
     </div>`;
@@ -864,7 +864,7 @@ function renderTradeForm() {
   const lastNav = latestNav(p);
   const defNav = lastNav ? lastNav[1] : "";
   $("tFormBox").innerHTML = `
-    <div class="note b">当前操作产品：<b>${esc(p.name)}</b><br>${esc(p.inst || "")}${p.prodCode ? " · 产品代码 " + esc(p.prodCode) : ""}</div>
+    <div class="note b">当前操作产品：<b>${esc(prodLabel(p))}</b><br>${esc(p.inst || "")}${p.prodCode ? " · 产品代码 " + esc(p.prodCode) : ""}</div>
     <div class="field" style="margin-top:12px"><label>交易类型</label>
       <select id="tType" onchange="renderTradeForm2()">
         <option value="buy">买入</option><option value="sell">赎回</option>
@@ -1093,10 +1093,165 @@ function saveProduct(pid) {
   renderProd(); renderHome();
   autoPush();
 }
+
+/* ============================================================
+   粘贴链接添加产品
+   ------------------------------------------------------------
+   为什么前端只做「抽键 + 判机构」、不抓页面：
+     跨域会被 CORS 拦死（这正是当初把抓取挪到 GitHub Actions 的原因），
+     而各行分享链接的 query 里基本都直接带着可用代码 ——
+     中国理财网 prodRegCode、北银 PROD_CODE、宁银 projectcode …
+
+   ★ 云端契约（勿改，改了这里会静默失效）：
+     fetch_nav.py 的 detect_org() 只看 inst / name / prodCode / code …
+     里的**关键词**，不看产品代码形态。所以用链接建产品时**必须把识别到的
+     机构名写进 inst**（如「北银理财」），否则云端会因「机构未识别 + 无名称」
+     直接跳过该产品，表现为「加了产品但永远抓不到净值」。
+     另外名称**故意留空**：merge_nav 只在字段为空时回填，留空云端才能把
+     真实产品名（来自中国理财网 productDetail）写上。
+   ============================================================ */
+const LINK_REG_KEYS = ["prodregcode", "regcode", "registercode", "zcode", "instcode",
+  "financingregistercode", "cpdjbm", "cpdjjbm"];
+const LINK_PROD_KEYS = ["prodcode", "productcode", "projectcode", "productid",
+  "sharecode", "salescode", "fundcode", "cpbm", "code"];
+
+/* 解析用户粘贴的链接/代码/文本 → { code, prodCode, org, ok, msg } */
+function parseProductInput(raw) {
+  const text = String(raw == null ? "" : raw).trim();
+  const norm = s => String(s).toUpperCase().replace(/[\s"']/g, "");
+  if (!text) return { code: "", prodCode: "", org: "", ok: false, msg: "请粘贴产品链接、产品代码或登记编码" };
+
+  /* ① 收集参数：URL query、hash 路由里的 query，以及「名称=值」形式的参数串 */
+  const params = {};
+  const eatQuery = (s) => {
+    const i = s.indexOf("?");
+    if (i < 0) return;
+    s.slice(i + 1).split("&").forEach(kv => {
+      const j = kv.indexOf("=");
+      if (j <= 0) return;
+      const k = kv.slice(0, j).toLowerCase().trim();
+      let v = kv.slice(j + 1).trim();
+      try { v = decodeURIComponent(v); } catch (e) { /* 原样保留 */ }
+      if (k && v) params[k] = v;
+    });
+  };
+  eatQuery(text);
+  const hi = text.indexOf("#");
+  if (hi >= 0) eatQuery(text.slice(hi));
+  text.replace(/([A-Za-z_]{3,24})\s*=\s*([^&\s]{4,40})/g, (m, k, v) => {
+    const kk = k.toLowerCase();
+    if (!params[kk]) params[kk] = v;
+    return m;
+  });
+  const pickParam = (keys) => { for (const k of keys) if (params[k]) return norm(params[k]); return ""; };
+
+  let code = pickParam(LINK_REG_KEYS);
+  let prodCode = pickParam(LINK_PROD_KEYS);
+  /* 参数值形态不对就不认（避免 ?code=weixin 之类被当成产品代码） */
+  if (code && !/^[ZC]\d{12,14}$/.test(code)) code = "";
+  if (prodCode && !detectOrgByProdCode(prodCode).org
+    && !/^[ZC]\d{12,14}$/.test(prodCode) && !/^[A-Z0-9]{6,20}$/.test(prodCode)) prodCode = "";
+
+  /* ② 全文候选兜底：切成「连续字母数字串」逐个用现有形态识别器归类 ——
+        不能直接全文正则扫，否则 Z7008926000006 里的 12 位数字会被误当成华夏的 12 位产品代码 */
+  const tokens = (text.match(/[A-Za-z0-9]{6,24}/g) || []).map(norm);
+  for (const tk of tokens) {
+    if (!code && /^[ZC]\d{12,14}$/.test(tk)) { code = tk; continue; }
+    if (!prodCode && detectOrgByProdCode(tk).org) prodCode = tk;
+  }
+
+  /* ③ 判机构 */
+  let org = prodCode ? detectOrgByProdCode(prodCode).org : "";
+  if (!org && code) org = "chinawealth";
+  const okay = !!(code || prodCode);
+  return { code, prodCode, org, ok: okay, msg: okay ? "" : "没从这段内容里认出产品代码或登记编码" };
+}
+
+/* 产品显示名：链接添加的骨架产品名称是空的（留给云端回填），列表要有兜底 */
+function prodLabel(p) {
+  if (!p) return "未命名产品";
+  return p.name || p.code || p.prodCode || "未命名产品";
+}
+/* 同代码去重 */
+function findDupProduct(r) {
+  const c = String(r.code || "").toUpperCase(), pc = String(r.prodCode || "").toUpperCase();
+  return DATA.products.find(p =>
+    (c && String(p.code || "").toUpperCase() === c) ||
+    (pc && String(p.prodCode || "").toUpperCase() === pc)) || null;
+}
+
+function openLinkAdd() {
+  openSheet(`<div class="sheet-t"><h3>粘贴链接添加产品</h3><button class="x" onclick="closeSheet()">✕</button></div>
+    <div class="note b" style="margin-bottom:12px">
+      把<b>产品页面链接</b>（银行 App / 微信里复制的那条）粘进来即可。<br>
+      链接里带产品代码或登记编码时自动识别；若贴的是公众号文章之类的链接，
+      请把<b>登记编码</b>或<b>产品代码</b>一并贴上。
+    </div>
+    <div class="field"><label>粘贴链接 / 代码 / 含代码的文本</label>
+      <textarea id="lkInput" rows="3" oninput="previewLink()" placeholder="https://… 或 Z7008926000006 / YJ01251204A"
+        style="width:100%;padding:11px 12px;border:1.5px solid var(--line);border-radius:11px;font-size:13px;font-family:inherit;color:var(--ink);outline:none;resize:vertical"></textarea>
+    </div>
+    <div id="lkPreview"></div>
+    <div class="field"><label>产品名称 <span class="muted">（可留空，云端抓到后自动补全）</span></label>
+      <input id="lkName" placeholder="留空即可">
+    </div>
+    <div class="field"><label>发行机构</label>
+      <input id="lkInst" placeholder="如 北银理财有限责任公司">
+      <div class="tip">云端靠这个字段选数据源：填理财公司全名（含「理财」即可），识别出代码时会自动补上</div>
+    </div>
+    <div class="row-btn">
+      <button class="btn gh" style="flex:1" onclick="closeSheet()">取消</button>
+      <button class="btn pri" style="flex:1" onclick="saveFromLink()">确认添加</button>
+    </div>`);
+  UI.linkParsed = null;
+  previewLink();
+}
+
+function previewLink() {
+  const box = $("lkPreview"); if (!box) return;
+  const r = parseProductInput($("lkInput") ? $("lkInput").value : "");
+  UI.linkParsed = r;
+  const instEl = $("lkInst");
+  /* ★ 机构必须落进 inst：云端 detect_org 靠它判机构（见本段顶部契约说明） */
+  if (r.org && instEl && !instEl.value.trim()) instEl.value = ORG_NAME[r.org] || "";
+  if (!r.ok) {
+    box.innerHTML = `<div class="note" style="margin-bottom:12px">${esc(r.msg)}</div>`;
+    return;
+  }
+  const dup = findDupProduct(r);
+  const lines = [];
+  if (r.code) lines.push(`登记编码 <b>${esc(r.code)}</b>`);
+  if (r.prodCode) lines.push(`产品代码 <b>${esc(r.prodCode)}</b>`);
+  if (r.org) lines.push(`识别机构 <b>${esc(ORG_NAME[r.org] || r.org)}</b>`);
+  box.innerHTML = `<div class="note${dup ? "" : " g"}" style="margin-bottom:12px">
+    ${lines.join(" · ")}<br>
+    ${dup ? `⚠️ 已存在同代码产品「${esc(prodLabel(dup))}」，无需重复添加`
+      : "保存后同步到云端，下一次抓取自动补全产品名称与历史净值。"}
+  </div>`;
+}
+
+function saveFromLink() {
+  const r = UI.linkParsed || parseProductInput($("lkInput") ? $("lkInput").value : "");
+  if (!r.ok) return toast(r.msg || "没识别出产品代码或登记编码");
+  if (findDupProduct(r)) return toast("已存在同代码产品，无需重复添加");
+  const inst = ($("lkInst").value || "").trim() || (ORG_NAME[r.org] || "");
+  if (!inst) return toast("请填写发行机构（如 招银理财）—— 云端据此选择数据源");
+  const name = ($("lkName").value || "").trim();   /* 允许留空：留给云端 merge_nav 回填 */
+  const target = {
+    id: uid(), navHistory: {}, createdAt: Date.now(),
+    code: r.code || "", prodCode: r.prodCode || "", name, inst, fromLink: true,
+  };
+  DATA.products.push(target);
+  saveLocal(); closeSheet();
+  const st = fetchStatus(target);
+  toast(`已添加${st.ok ? "，" + st.txt : "。" + st.txt}。云端抓取后会自动补全名称与净值`, st.ok ? 3200 : 4400);
+  renderProd(); renderHome();
+  autoPush();
+}
 function openNav(pid) {
   const p = DATA.products.find(x => x.id === pid); if (!p) return;
   const s = navSeries(p).slice().reverse();
-  openSheet(`<div class="sheet-t"><h3>${esc(p.name)} · 净值</h3><button class="x" onclick="closeSheet()">✕</button></div>
+  openSheet(`<div class="sheet-t"><h3>${esc(prodLabel(p))} · 净值</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="field"><label>新增/修改净值</label>
       <div class="two">
         <input type="date" id="nDate" value="${today()}">
@@ -1157,7 +1312,7 @@ function refreshNav() {
   const rows = DATA.products.map(p => {
     const st = fetchStatus(p);
     return `<div class="sumline" style="align-items:flex-start">
-      <span class="k" style="flex:1">${esc(p.name || p.id)}</span>
+      <span class="k" style="flex:1">${esc(prodLabel(p))}</span>
       <b class="${st.ok ? "down" : "muted"}" style="font-size:10.5px;text-align:right;margin-left:8px">${esc(st.txt)}</b>
     </div>`;
   }).join("") || `<div class="empty">暂无产品</div>`;
