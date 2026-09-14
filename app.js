@@ -133,7 +133,7 @@ function fetchStatus(p) {
 */
 let DATA = { products: [], trades: [], settings: { hideAmount: false } };
 let SYNC = { owner: "", repo: "", path: "licai-data.json", token: "", sha: "", auto: true };
-let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "" };
+let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active" };
 
 /* ---------- 工具 ---------- */
 const $ = id => document.getElementById(id);
@@ -312,6 +312,38 @@ function navHit(p, date) {
   return navOnOrBefore(p, date);
 }
 
+/* ---------- 确认口径（T+1）----------
+   理财产品申购/赎回都是「T 日申请、T+1 日确认」，确认日之前份额未到账：
+     · 不计入持仓份额与市值
+     · 不产生收益
+   所以凡是要「结算到某一天为止」的地方，都不能直接用 position().shares（那是今天的），
+   要用 sharesOn(p, date) —— 否则历史日历/区间收益会拿今天的份额去乘过去的净值差。 */
+
+/* 截至 date 已确认的持仓份额（只累加确认日 <= date 的交易） */
+function sharesOn(p, date) {
+  let sh = 0;
+  for (const t of DATA.trades) {
+    if (t.prodId !== p.id) continue;
+    const cd = t.confirmDate || t.tradeDate || "";
+    if (!cd || cd > date) continue;              /* 未确认：份额还没到账 */
+    if (t.type === "buy") sh += tradeShares(t, p);
+    else sh = Math.max(0, sh - (Number(t.shares) || 0));
+  }
+  return sh;
+}
+
+/* 该产品是否有过交易（用于区分「已清仓」与「从未建仓」） */
+function hasAnyTrade(p) { return DATA.trades.some(t => t.prodId === p.id); }
+
+/* 该日是否有任一产品披露了净值。
+   用来区分「未披露」（无数据，不该显示成 0）与「收益为 0」（有净值但持平）。 */
+function dayDisclosed(date) {
+  return DATA.products.some(p => {
+    const v = navAt(p, date);
+    return v !== undefined && v !== null && v !== "";
+  });
+}
+
 /* 某交易发生的确认净值：优先用户填的，否则取确认日（或买入日）当天净值 */
 function resolveTradeNav(t, p) {
   if (t.confirmNav) return Number(t.confirmNav);
@@ -331,15 +363,25 @@ function tradeShares(t, p) {
   }
 }
 
-/* 某产品当前持仓：份额、成本（成本法：加权平均） */
+/* 某产品当前持仓：份额、成本（成本法：加权平均）
+   确认口径：只有确认日 <= 今天的买入才计入 shares/cost；
+   确认日 > 今天的买入进 pendingShares/pendingAmount（在途），不计息、不显示市值。 */
 function position(p) {
-  const ts = DATA.trades.filter(t => t.prodId === p.id).sort((a, b) => (a.confirmDate || a.tradeDate).localeCompare(b.confirmDate || b.tradeDate));
+  const td = today();
+  const ts = DATA.trades.filter(t => t.prodId === p.id)
+    .sort((a, b) => (a.confirmDate || a.tradeDate || "").localeCompare(b.confirmDate || b.tradeDate || ""));
   let shares = 0, cost = 0, realized = 0;
+  let pendingShares = 0, pendingAmount = 0, startDate = "";
   for (const t of ts) {
+    const cd = t.confirmDate || t.tradeDate || "";
+    const confirmed = !cd || cd <= td;
     if (t.type === "buy") {
       const sh = tradeShares(t, p); const amt = Number(t.amount) || 0;
+      if (!confirmed) { pendingShares += sh; pendingAmount += amt; continue; }
+      if (!startDate) startDate = cd;
       shares += sh; cost += amt;
     } else {
+      if (!confirmed) continue;                /* 赎回确认前，持仓不动 */
       /* 赎回：按当前均价成本扣减，差额计入已实现 */
       const sh = Math.min(Number(t.shares) || 0, shares);
       const nav = Number(t.confirmNav) || resolveTradeNav(t, p) || 0;
@@ -354,53 +396,63 @@ function position(p) {
   const last = latestNav(p);
   const lastNav = last ? last[1] : 0;
   const lastDate = last ? last[0] : "";
-  const market = shares * lastNav;
+  /* 在途：有买入但一份都没确认 → 不显示市值/收益（由 UI 显示 "-"） */
+  const hasPending = pendingShares > 0;
+  const inTransit = shares <= 0 && hasPending;
+  const market = inTransit ? 0 : shares * lastNav;
   const profit = market - cost;               /* 持仓浮盈 */
   /* 持有天数与年化 */
-  const firstBuy = ts.find(t => t.type === "buy");
-  const startDate = firstBuy ? (firstBuy.confirmDate || firstBuy.tradeDate) : "";
-  const holdDays = startDate ? Math.max(dayDiff(startDate, lastDate || today()), 1) : 0;
+  const holdDays = startDate ? Math.max(dayDiff(startDate, lastDate || td), 1) : 0;
   let holdAnnual = (cost > 0 && holdDays > 0) ? (profit / cost) * 365 / holdDays : 0;
   /* 持有不足 7 天时，年化会把短期波动放大成极端值（如 2 天 3% → 571%），
      横截面上会误导用户。低于 7 天不给年化，改由页面展示"持有不足"提示。 */
   const annualValid = holdDays >= 7;
   if (!annualValid) holdAnnual = 0;
-  return { shares, cost, market, profit, realized, lastNav, lastDate, startDate, holdDays, holdAnnual, annualValid, navSeries: navSeries(p) };
+  return { shares, cost, market, profit, realized, lastNav, lastDate, startDate, holdDays, holdAnnual, annualValid,
+           pendingShares, pendingAmount, hasPending, inTransit, navSeries: navSeries(p) };
 }
 
-/* 全仓汇总 */
+/* 全仓汇总（三态）
+   持仓中：已有确认份额（或已产生已实现收益）
+   在途：  有买入但一份都未确认（T+1），不计入总额
+   已清仓：份额归零但留下过交易 —— 单独归档，别让它从账本里消失 */
 function portfolio() {
-  const rows = DATA.products.map(p => ({ p, pos: position(p) })).filter(r => r.pos.shares > 0 || r.pos.realized !== 0);
+  const all = DATA.products.map(p => ({ p, pos: position(p) }));
+  const rows = all.filter(r => r.pos.shares > 0);
+  const pendingRows = all.filter(r => r.pos.inTransit);
+  const closedRows = all.filter(r => r.pos.shares <= 0 && !r.pos.inTransit && hasAnyTrade(r.p));
   const totalAsset = rows.reduce((s, r) => s + r.pos.market, 0);
   const totalCost = rows.reduce((s, r) => s + r.pos.cost, 0);
+  const totalPending = pendingRows.reduce((s, r) => s + r.pos.pendingAmount, 0);
   const totalRealized = DATA.trades.filter(t => t.type === "sell").reduce((s, t) => s + (Number(t.realized) || 0), 0);
-  return { rows, totalAsset, totalCost, totalRealized };
+  return { rows, pendingRows, closedRows, totalAsset, totalCost, totalPending, totalRealized };
 }
 
-/* 两个日期区间内整体收益（按各产品净值变动 × 份额） */
+/* 两个日期区间内整体收益（按各产品净值变动 × 区间末的已确认份额） */
 function periodProfit(fromDate, toDate) {
   let s = 0;
   for (const p of DATA.products) {
-    const pos = position(p);
-    if (pos.shares <= 0) continue;
+    const sh = sharesOn(p, toDate);
+    if (sh <= 0) continue;
     const a = navOnOrBefore(p, fromDate), b = navOnOrBefore(p, toDate);
     if (!a || !b) continue;
-    s += pos.shares * (Number(b[1]) - Number(a[1]));
+    s += sh * (Number(b[1]) - Number(a[1]));
   }
   return s;
 }
 /* 某一天的收益：仅当该日「有净值更新」时才计入（以净值日期为准）。
-   避免周末/节假日把上一个交易日的收益重复显示。 */
+   避免周末/节假日把上一个交易日的收益重复显示。
+   份额取「截至该日已确认的份额」—— 申购确认前不该凭空生息。 */
 function dayProfit(date) {
   let s = 0;
   for (const p of DATA.products) {
-    const pos = position(p);
-    if (pos.shares <= 0) continue;
+    const sh = sharesOn(p, date);
+    if (sh <= 0) continue;
     const s0 = navSeries(p);
     /* 找到净值日期恰好等于 date 的那条；没有则该日无收益 */
     const idx = s0.findIndex(x => x[0] === date);
     if (idx <= 0) continue;
-    s += pos.shares * (Number(s0[idx][1]) - Number(s0[idx - 1][1]));
+    s += sh * (Number(s0[idx][1]) - Number(s0[idx - 1][1]));
   }
   return s;
 }
@@ -413,8 +465,8 @@ function monthProfit(y, m) {
   const last = `${y}-${pad(m)}-${pad(lastD)}`;
   let s = 0;
   for (const p of DATA.products) {
-    const pos = position(p);
-    if (pos.shares <= 0) continue;
+    const sh = sharesOn(p, last);
+    if (sh <= 0) continue;
     let a = navOnOrBefore(p, first);
     const b = navOnOrBefore(p, last);
     if (!b) continue;
@@ -424,7 +476,7 @@ function monthProfit(y, m) {
       a = s0.find(x => x[0] >= first && x[0] <= last) || null;
       if (!a || a[0] === b[0]) continue; /* 该月只有一条净值，无变动 */
     }
-    s += pos.shares * (Number(b[1]) - Number(a[1]));
+    s += sh * (Number(b[1]) - Number(a[1]));
   }
   return s;
 }
@@ -443,7 +495,8 @@ function annualize(profit, y, m) {
 function renderHome() {
   const pf = portfolio();
   $("totalAsset").textContent = DATA.settings.hideAmount ? "****" : money(pf.totalAsset);
-  $("tradeHint").textContent = `共 ${DATA.trades.length} 笔交易 · ${pf.rows.length} 只持仓`;
+  $("tradeHint").textContent = `共 ${DATA.trades.length} 笔交易 · ${pf.rows.length} 只持仓`
+    + (pf.pendingRows.length ? ` · ${pf.pendingRows.length} 只在途` : "");
   /* 今日/区间收益 */
   const now = new Date(); const y = now.getFullYear(), m = now.getMonth() + 1;
   let val = 0, lab = "";
@@ -484,14 +537,17 @@ function renderCal() {
   if (!UI.calY) { UI.calY = now.getFullYear(); UI.calM = now.getMonth() + 1; }
   const y = UI.calY, m = UI.calM;
   $("calTitle").textContent = `${y}年${m}月`;
-  /* 每日收益映射 */
-  const dm = {};
+  /* 每日收益映射。
+     关键：区分「未披露」与「收益为 0」——
+     没有净值的那天不是「没赚钱」，而是「还没披露」，显示成空白会误导。 */
+  const dm = {};                 /* 已披露：日期 -> 当日收益（含 0） */
+  const undis = {};              /* 已过去但没有净值披露 */
   const days = new Date(y, m, 0).getDate();
   for (let dd = 1; dd <= days; dd++) {
     const ds = `${y}-${pad(m)}-${pad(dd)}`;
     if (ds > today()) continue;
-    const v = dayProfit(ds);
-    if (Math.abs(v) > 0.0001) dm[dd] = v;
+    if (!dayDisclosed(ds)) { undis[dd] = true; continue; }
+    dm[dd] = dayProfit(ds);
   }
   const first = new Date(y, m - 1, 1).getDay();
   let h = "";
@@ -500,18 +556,26 @@ function renderCal() {
   const tds = today();
   for (let dd = 1; dd <= days; dd++) {
     const ds = `${y}-${pad(m)}-${pad(dd)}`;
+    const has = dm[dd] !== undefined;
     const v = dm[dd];
-    const has = v !== undefined;
+    const isUnd = !!undis[dd];
     const selc = (UI.selDate === ds) ? " sel" : "";
     const todayc = (ds === tds) ? " today" : "";
     const negc = (has && v < 0) ? " neg" : "";
-    h += `<div class="d${has ? " has" : ""}${negc}${selc}${todayc}" ${has ? `onclick="pickDay('${ds}')"` : ""}>
+    const undiscls = isUnd ? " undis" : "";
+    h += `<div class="d${has ? " has" : ""}${negc}${undiscls}${selc}${todayc}" ${has ? `onclick="pickDay('${ds}')"` : ""}>
             <span class="dd">${dd}</span>
-            ${has ? `<span class="val">${signMoney(v)}</span>` : ""}
+            ${has ? `<span class="val">${signMoney(v)}</span>` : (isUnd ? `<span class="und">未披露</span>` : "")}
           </div>`;
   }
   $("calGrid").innerHTML = h;
-  $("calTip").textContent = "方格显示的为当日收益，点选查看该日收益明细。节假日无净值变动则不显示。";
+  $("calTip").innerHTML =
+    `<div class="legend">
+       <span><i style="background:var(--up)"></i>正收益</span>
+       <span><i style="background:var(--down)"></i>负收益</span>
+       <span><i style="background:#d9dbe6"></i>未披露</span>
+     </div>
+     收益归「净值披露日」归属，未披露日不做均摊；点选有数值的方格可看当日明细。`;
 }
 function calMove(d) {
   let m = UI.calM + d, y = UI.calY;
@@ -520,13 +584,81 @@ function calMove(d) {
 }
 function pickDay(ds) { UI.selDate = (UI.selDate === ds ? "" : ds); renderCal(); renderDetail(); }
 
-/* ---------- 明细 ---------- */
+/* ---------- 明细（三态：持仓中 / 在途 / 已清仓）---------- */
+function setDetTab(btn, tab) {
+  btn.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("on"));
+  btn.classList.add("on");
+  UI.detTab = tab; renderDetail();
+}
+/* 在途卡片：确认前不显示市值与收益，只显示在途金额与预估份额 */
+function pendingHtml(list) {
+  return list.map(({ p, pos }) => `<div class="grp">
+    <div class="grp-h">
+      <div class="av">${esc(String(p.inst || p.name || "?").slice(0, 1))}</div>
+      <div class="nm">${esc(p.name)}<span class="state-chip">交易在途</span></div>
+      <div class="amt muted">待确认</div>
+    </div>
+    <div class="prow transit">
+      <div class="pn">${esc(p.inst || "")}</div>
+      <div class="pv muted">-</div>
+      <div class="pk">
+        <i>在途金额 <b>${DATA.settings.hideAmount ? "****" : money(pos.pendingAmount)}</b></i>
+        <i>预估份额 <b>${pos.pendingShares.toFixed(2)}</b></i>
+        <i>市值 <b class="muted">-</b></i>
+        <i>持仓收益 <b class="muted">-</b></i>
+        <i>确认后自动计入持仓</i>
+      </div>
+    </div>
+  </div>`).join("");
+}
+/* 已清仓卡片：份额归零但保留历史已实现收益，避免产品凭空消失 */
+function closedHtml(list) {
+  return list.map(({ p, pos }) => {
+    const n = DATA.trades.filter(t => t.prodId === p.id && t.type === "sell").length;
+    return `<div class="grp">
+    <div class="grp-h">
+      <div class="av">${esc(String(p.inst || p.name || "?").slice(0, 1))}</div>
+      <div class="nm">${esc(p.name)}<span class="state-chip closed">已清仓</span></div>
+      <div class="amt ${cls(pos.realized)}">${signMoney(pos.realized)}</div>
+    </div>
+    <div class="prow">
+      <div class="pn">已实现收益</div>
+      <div class="pv ${cls(pos.realized)}">${signMoney(pos.realized)}</div>
+      <div class="pk">
+        <i>已核算赎回 <b>${n} 笔</b></i>
+        <i>持仓份额 <b>0.00</b></i>
+        <i>最新净值 <b>${pos.lastNav.toFixed(4)}</b></i>
+      </div>
+    </div>
+  </div>`;
+  }).join("");
+}
 function renderDetail() {
   const date = UI.selDate || latestDateAll() || today();
   $("detTitle").innerHTML = `收益明细 <span class="date">· ${date}</span>`;
   const pf = portfolio();
+  /* 三态 tab（带计数；在途非零时用金色提示，避免漏看未确认的交易） */
+  const tabs = [["active", "持仓中", pf.rows.length, false],
+                ["pending", "在途", pf.pendingRows.length, true],
+                ["closed", "已清仓", pf.closedRows.length, false]];
+  if ($("detTabs")) {
+    $("detTabs").innerHTML = tabs.map(([k, lab, n, warn]) =>
+      `<button class="${UI.detTab === k ? "on" : ""}" onclick="setDetTab(this,'${k}')">${lab}<span class="n${(warn && n) ? " warn" : ""}"> ${n}</span></button>`
+    ).join("");
+  }
+  const list = UI.detTab === "pending" ? pf.pendingRows
+    : UI.detTab === "closed" ? pf.closedRows : pf.rows;
+  if (!list.length) {
+    const tip = UI.detTab === "pending" ? "没有在途交易。申购/赎回确认后会转入「持仓中」。"
+      : UI.detTab === "closed" ? "还没有已清仓的产品。"
+        : "还没有持仓，点「进入」交易中心添加第一笔买入";
+    $("detBody").innerHTML = `<div class="empty">${tip}</div>`; return;
+  }
+  if (UI.detTab === "pending") { $("detBody").innerHTML = pendingHtml(list); return; }
+  if (UI.detTab === "closed") { $("detBody").innerHTML = closedHtml(list); return; }
+
   const groups = {};
-  for (const r of pf.rows) {
+  for (const r of list) {
     const pos = r.pos;
     /* 当日盈亏：仅当该日有净值更新时计入（见 dayProfit 的说明） */
     const s0 = navSeries(r.p);
@@ -538,7 +670,6 @@ function renderDetail() {
   }
   let html = "";
   const keys = Object.keys(groups);
-  if (!keys.length) { $("detBody").innerHTML = `<div class="empty">还没有持仓，点「进入」交易中心添加第一笔买入</div>`; return; }
   if (UI.groupBy === "sort") {
     /* 排序：按当日盈亏降序 */
     const all = keys.flatMap(k => groups[k]).sort((a, b) => b.dayP - a.dayP);
