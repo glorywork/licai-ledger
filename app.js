@@ -10,7 +10,7 @@ const LS_SYNC = "licai_ledger_sync_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v12";
+const APP_VER = "v13";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -137,7 +137,7 @@ function fetchStatus(p) {
 */
 let DATA = { products: [], trades: [], settings: { hideAmount: false } };
 let SYNC = { owner: "", repo: "", path: "licai-data.json", token: "", sha: "", auto: true };
-let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7" };
+let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7", detQ: "", detInst: "", detSort: "dayP", detAsc: false };
 
 /* ---------- 工具 ---------- */
 const $ = id => document.getElementById(id);
@@ -590,6 +590,51 @@ function calMove(d) {
 function pickDay(ds) { UI.selDate = (UI.selDate === ds ? "" : ds); renderCal(); renderDetail(); }
 
 /* ---------- 明细（三态：持仓中 / 在途 / 已清仓）---------- */
+/* 排序维度（默认「当日盈亏」，与改造前行为一致，避免默认视图突变） */
+const DET_SORTS = [
+  ["dayP", "当日盈亏"], ["mkt", "市值"], ["profit", "持仓收益"], ["annual", "年化"],
+  ["a7", "近7日"], ["a30", "近1月"], ["wan", "万收"], ["upd", "更新"], ["days", "天数"],
+];
+/* 机构简称：把「XX理财有限责任公司」压成「XX理财」，筛选 chip 才放得下 */
+function instShort(inst) {
+  const s = String(inst || "").trim().replace(/(有限责任公司|股份有限公司|有限公司|公司)$/, "");
+  return s || "未填机构";
+}
+/* 产品级净值指标（只在按 近7日/近14日/近1月/万收 排序时才需要，避免每次渲染都算） */
+function prodMetrics(p) {
+  const st = navStats(p);
+  return { a7: lastNum(st.a7), a14: lastNum(st.a14), a30: lastNum(st.a30), wan: lastNum(st.wan), count: st.vals.length };
+}
+/* 取某行的排序值；无该指标时返回 null（null 永远排最后，不参与方向翻转） */
+function detSortVal(x, key, m) {
+  switch (key) {
+    case "mkt": return x.pos.market;
+    case "profit": return x.pos.profit;
+    case "annual": return x.pos.annualValid ? x.pos.holdAnnual : null;
+    case "a7": return m ? m.a7 : null;
+    case "a30": return m ? m.a30 : null;
+    case "wan": return m ? m.wan : null;
+    case "upd": return x.pos.lastDate || null;
+    case "days": return x.pos.holdDays;
+    default: return x.dayP;
+  }
+}
+function setDetSort(key) {
+  if (UI.detSort === key) UI.detAsc = !UI.detAsc;      /* 再点一次翻转方向 */
+  else { UI.detSort = key; UI.detAsc = false; }        /* 默认降序：大的在前 */
+  renderDetail();
+}
+function setDetInst(v) { UI.detInst = v; renderDetail(); }
+function onDetSearch() {
+  const el = $("detSearch");
+  UI.detQ = el ? el.value : "";
+  renderDetailBody();                                   /* 只重画列表，输入框不被重建 → 不丢焦点 */
+}
+function clearDetSearch() {
+  if ($("detSearch")) $("detSearch").value = "";
+  UI.detQ = ""; renderDetail();
+}
+
 function setDetTab(btn, tab) {
   btn.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("on"));
   btn.classList.add("on");
@@ -638,6 +683,41 @@ function closedHtml(list) {
   </div>`;
   }).join("");
 }
+
+/* 当前 tab 的行集合 */
+function detTabList(pf) {
+  return UI.detTab === "pending" ? pf.pendingRows
+    : UI.detTab === "closed" ? pf.closedRows : pf.rows;
+}
+/* 机构筛选 + 关键字搜索（三者都要过） */
+function detFilter(list) {
+  let out = list;
+  if (UI.detInst) out = out.filter(r => (r.p.inst || "") === UI.detInst);
+  const q = String(UI.detQ || "").trim().toLowerCase();
+  if (q) {
+    out = out.filter(r => [r.p.name, r.p.code, r.p.prodCode, r.p.inst, prodLabel(r.p)]
+      .some(v => String(v == null ? "" : v).toLowerCase().indexOf(q) >= 0));
+  }
+  return out;
+}
+/* 排序（仅持仓中 tab 有意义；在途/已清仓不显示排序 chip） */
+function detSort(list) {
+  const key = UI.detSort, asc = !!UI.detAsc;
+  const needM = ["a7", "a30", "wan"].indexOf(key) >= 0;
+  const M = {};
+  if (needM) for (const x of list) M[x.r.p.id] = prodMetrics(x.r.p);
+  return [...list].sort((a, b) => {
+    const va = detSortVal(a, key, M[a.r.p.id]);
+    const vb = detSortVal(b, key, M[b.r.p.id]);
+    const na = va === null || va === undefined || va === "", nb = vb === null || vb === undefined || vb === "";
+    if (na && nb) return 0;
+    if (na) return 1;                     /* 无数据的排最后，不随方向翻转 */
+    if (nb) return -1;
+    const d = typeof va === "string" ? String(va).localeCompare(String(vb)) : (va - vb);
+    return asc ? d : -d;
+  });
+}
+
 function renderDetail() {
   const date = UI.selDate || latestDateAll() || today();
   $("detTitle").innerHTML = `收益明细 <span class="date">· ${date}</span>`;
@@ -651,35 +731,68 @@ function renderDetail() {
       `<button class="${UI.detTab === k ? "on" : ""}" onclick="setDetTab(this,'${k}')">${lab}<span class="n${(warn && n) ? " warn" : ""}"> ${n}</span></button>`
     ).join("");
   }
-  const list = UI.detTab === "pending" ? pf.pendingRows
-    : UI.detTab === "closed" ? pf.closedRows : pf.rows;
+  const tabList = detTabList(pf);
+
+  /* 机构筛选 chips（按该 tab 的实际机构生成，只有一家时不必占位） */
+  if ($("detInstChips")) {
+    const cnt = {};
+    for (const r of tabList) { const k = r.p.inst || ""; cnt[k] = (cnt[k] || 0) + 1; }
+    const keys = Object.keys(cnt);
+    const multi = keys.length > 1;
+    $("detInstChips").innerHTML = !multi ? "" : `<button class="chip${UI.detInst === "" ? " on" : ""}" onclick="setDetInst('')">全部 ${tabList.length}</button>`
+      + keys.map(k => `<button class="chip${UI.detInst === k ? " on" : ""}" onclick="setDetInst(${JSON.stringify(k).replace(/"/g, "&quot;")})">${esc(instShort(k))} ${cnt[k]}</button>`).join("");
+    /* 选中的机构已不在当前 tab 里（切 tab 后）→ 自动回到全部，避免空白页 */
+    if (UI.detInst && keys.indexOf(UI.detInst) < 0) UI.detInst = "";
+  }
+  /* 排序 chips（仅持仓中；在途/已清仓排序无意义） */
+  if ($("detSortChips")) {
+    $("detSortChips").innerHTML = UI.detTab !== "active" ? "" :
+      DET_SORTS.map(([k, lab]) =>
+        `<button class="chip${UI.detSort === k ? " on" : ""}" onclick="setDetSort('${k}')">${lab}${UI.detSort === k ? (UI.detAsc ? " ↑" : " ↓") : ""}</button>`
+      ).join("");
+  }
+  renderDetailBody();
+}
+
+function renderDetailBody() {
+  const pf = portfolio();
+  const date = UI.selDate || latestDateAll() || today();
+  const tabList = detTabList(pf);
+  const total = tabList.length;
+  let list = detFilter(tabList);
+  const filtered = UI.detInst || String(UI.detQ || "").trim();
+  if (filtered) {
+    $("detTitle").innerHTML = `收益明细 <span class="date">· ${date}</span> <span class="muted" style="font-size:11px">筛出 ${list.length}/${total}</span>`;
+  }
   if (!list.length) {
-    const tip = UI.detTab === "pending" ? "没有在途交易。申购/赎回确认后会转入「持仓中」。"
-      : UI.detTab === "closed" ? "还没有已清仓的产品。"
-        : "还没有持仓，点「进入」交易中心添加第一笔买入";
+    const tip = filtered ? "没有匹配的产品，点「清除」重置筛选"
+      : UI.detTab === "pending" ? "没有在途交易。申购/赎回确认后会转入「持仓中」。"
+        : UI.detTab === "closed" ? "还没有已清仓的产品。"
+          : "还没有持仓，点「进入」交易中心添加第一笔买入";
     $("detBody").innerHTML = `<div class="empty">${tip}</div>`; return;
   }
   if (UI.detTab === "pending") { $("detBody").innerHTML = pendingHtml(list); return; }
   if (UI.detTab === "closed") { $("detBody").innerHTML = closedHtml(list); return; }
 
-  const groups = {};
-  for (const r of list) {
-    const pos = r.pos;
-    /* 当日盈亏：仅当该日有净值更新时计入（见 dayProfit 的说明） */
+  /* 当日盈亏：仅当该日有净值更新时计入（见 dayProfit 的说明） */
+  const rows = list.map(r => {
     const s0 = navSeries(r.p);
     const idx = s0.findIndex(x => x[0] === date);
-    const dayP = idx > 0 ? pos.shares * (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0;
-    const dayNavChange = idx > 0 ? (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0;
-    const key = UI.groupBy === "inst" ? (r.p.inst || "未分组") : "全部产品";
-    (groups[key] = groups[key] || []).push({ r, pos, dayP, dayNavChange });
+    return {
+      r, pos: r.pos,
+      dayP: idx > 0 ? r.pos.shares * (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0,
+      dayNavChange: idx > 0 ? (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0,
+    };
+  });
+  const sorted = detSort(rows);
+
+  const groups = {};
+  const sortLab = (DET_SORTS.find(x => x[0] === UI.detSort) || DET_SORTS[0])[1];
+  for (const x of sorted) {
+    const key = UI.groupBy === "inst" ? (x.r.p.inst || "未分组") : `按${sortLab}排序`;
+    (groups[key] = groups[key] || []).push(x);
   }
   let html = "";
-  const keys = Object.keys(groups);
-  if (UI.groupBy === "sort") {
-    /* 排序：按当日盈亏降序 */
-    const all = keys.flatMap(k => groups[k]).sort((a, b) => b.dayP - a.dayP);
-    groups["按当日盈亏排序"] = all; delete groups["全部产品"];
-  }
   for (const k of Object.keys(groups)) {
     const arr = groups[k];
     const sum = arr.reduce((s, x) => s + x.dayP, 0);
