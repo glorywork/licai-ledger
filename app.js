@@ -10,7 +10,7 @@ const LS_SYNC = "licai_ledger_sync_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v11";
+const APP_VER = "v12";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -137,7 +137,7 @@ function fetchStatus(p) {
 */
 let DATA = { products: [], trades: [], settings: { hideAmount: false } };
 let SYNC = { owner: "", repo: "", path: "licai-data.json", token: "", sha: "", auto: true };
-let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active" };
+let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7" };
 
 /* ---------- 工具 ---------- */
 const $ = id => document.getElementById(id);
@@ -694,7 +694,7 @@ function renderDetail() {
         ? `<b class="${cls(x.pos.holdAnnual)}">${pct(x.pos.holdAnnual)}</b>`
         : `<b class="muted">持有不足7天</b>`;
       html += `<div class="prow">
-        <div class="pn">${esc(prodLabel(x.r.p))}</div>
+        <div class="pn"><button class="link" onclick="openProdDetail('${x.r.p.id}')">${esc(prodLabel(x.r.p))}</button></div>
         <div class="pv ${cls(x.dayP)}">${signMoney(x.dayP)}</div>
         <div class="pk">
           <i>持有金额 <b>${DATA.settings.hideAmount ? "****" : money(x.pos.market)}</b></i>
@@ -759,11 +759,12 @@ function renderProd() {
       const l = latestNav(p);
       const st = fetchStatus(p);
       return `<div class="pick" style="cursor:default">
-        <div class="p1">${esc(prodLabel(p))} <span class="wr" style="font-size:10.5px;color:var(--ink3)">${esc(p.inst || "")}</span></div>
+        <div class="p1"><button class="link" onclick="openProdDetail('${p.id}')">${esc(prodLabel(p))}</button> <span class="wr" style="font-size:10.5px;color:var(--ink3)">${esc(p.inst || "")}</span></div>
         <div class="p2">登记编码 ${esc(p.code || "-")} · 产品代码 <b>${esc(p.prodCode || "-")}</b></div>
         <div class="p2" style="color:${st.ok ? "#0d7a52" : "#8a6300"}">${st.txt}</div>
         <div class="p3">份额 ${pos.shares.toFixed(2)} · 成本 ${money(pos.cost)} · 市值 ${money(pos.market)} · 浮盈 <b class="${cls(pos.profit)}">${signMoney(pos.profit)}</b> · 净值 ${l ? l[1].toFixed(4) + " (" + l[0] + ")" : "无数据"}</div>
         <div class="row-btn" style="margin-top:8px">
+          <button class="mini" onclick="openProdDetail('${p.id}')">详情</button>
           <button class="mini" onclick="editProd('${p.id}')">编辑</button>
           <button class="mini" onclick="openNav('${p.id}')">录入/查看净值</button>
           <button class="mini" onclick="delProd('${p.id}')">删除</button>
@@ -1247,6 +1248,243 @@ function saveFromLink() {
   toast(`已添加${st.ok ? "，" + st.txt : "。" + st.txt}。云端抓取后会自动补全名称与净值`, st.ok ? 3200 : 4400);
   renderProd(); renderHome();
   autoPush();
+}
+
+/* ============================================================
+   产品详情：单位净值曲线 + 叠加指标（7日年化 / 万份收益）
+   ------------------------------------------------------------
+   口径（与设置页「口径说明」一致，勿私下改）：
+     · 万份收益(元) = (今日净值 − 昨日净值) × 10000
+     · N 日年化     = (nav[t] / nav[t−N] − 1) / N × 365
+     · 成立以来年化 = (末值 / 首值 − 1) / 持有天数 × 365
+   全部即时计算、不落盘。图表为内联 SVG 自绘，不引任何库/CDN。
+   ============================================================ */
+const PROD_RANGES = [["1m", "近1月", 30], ["3m", "近3月", 90], ["6m", "近6月", 180], ["1y", "近1年", 365], ["all", "成立来", 0]];
+
+/* N 日年化序列（前 N 个点无值 → null，保证与净值序列一一对齐） */
+function annualNArr(vals, n) {
+  return vals.map((v, i) => {
+    if (i < n) return null;
+    const a = Number(vals[i - n]);
+    return a > 0 ? (v / a - 1) / n * 365 : null;
+  });
+}
+/* 一组净值指标（全部与 vals 等长对齐） */
+function navStats(p) {
+  const s = navSeries(p);
+  const dates = s.map(x => x[0]);
+  const vals = s.map(x => Number(x[1]));
+  /* 万份收益：首日无前值 */
+  const wan = vals.map((v, i) => (i === 0 ? null : (v - Number(vals[i - 1])) * 10000));
+  return { dates, vals, wan, a7: annualNArr(vals, 7), a14: annualNArr(vals, 14), a30: annualNArr(vals, 30) };
+}
+/* 成立以来年化（单一数值） */
+function sinceAnnual(stats) {
+  const { dates, vals } = stats;
+  if (vals.length < 2) return null;
+  const a = Number(vals[0]), b = Number(vals[vals.length - 1]);
+  const days = dayDiff(dates[0], dates[dates.length - 1]);
+  if (!(a > 0) || days <= 0) return null;
+  return (b / a - 1) / days * 365;
+}
+/* 末位有效值（叠加指标可能末端为 null） */
+function lastNum(arr) {
+  for (let i = arr.length - 1; i >= 0; i--) if (arr[i] !== null && isFinite(arr[i])) return arr[i];
+  return null;
+}
+
+/* 内联 SVG 双轴折线图：vals 走左轴（净值），ov 走右轴（叠加指标） */
+function svgChart(dates, vals, ov) {
+  const W = 640, H = 230, L = 50, R = 58, T = 16, B = 26;
+  const iw = W - L - R, ih = H - T - B;
+  const n = vals.length;
+  if (!n) return `<div class="empty">该区间内没有净值数据</div>`;
+  let nMin = vals[0], nMax = vals[0];
+  for (const v of vals) { if (v < nMin) nMin = v; if (v > nMax) nMax = v; }
+  const span = (nMax - nMin) || Math.max(nMax * 0.004, 0.0008);
+  const lo = nMin - span * 0.18, hi = nMax + span * 0.18;
+  const Yn = v => T + (1 - (v - lo) / (hi - lo)) * ih;
+  const X = i => (n === 1 ? L + iw / 2 : L + i / (n - 1) * iw);
+
+  /* 叠加序列的右轴域（必须含 0，否则看不出正负） */
+  let oLo = 0, oHi = 0, hasOv = false, Yo = () => T;
+  if (ov) {
+    let mn = Infinity, mx = -Infinity, cnt = 0;
+    for (const v of ov) if (v !== null && isFinite(v)) { cnt++; if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (cnt >= 2) {
+      hasOv = true;
+      oLo = Math.min(0, mn); oHi = Math.max(0, mx);
+      if (oHi - oLo < 1e-9) oHi = oLo + 1;
+      Yo = v => T + (1 - (v - oLo) / (oHi - oLo)) * ih;
+    }
+  }
+  const navPts = [];
+  for (let i = 0; i < n; i++) navPts.push(X(i).toFixed(1) + "," + Yn(vals[i]).toFixed(1));
+  const area = `${L},${(T + ih).toFixed(1)} ` + navPts.join(" ") + ` ${(L + iw).toFixed(1)},${(T + ih).toFixed(1)}`;
+
+  let g = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" style="display:block">`;
+  g += `<polygon points="${area}" fill="rgba(91,91,214,.10)" stroke="none"/>`;
+  if (hasOv) {
+    const op = [];
+    for (let i = 0; i < n; i++) {
+      const v = ov[i];
+      if (v === null || !isFinite(v)) continue;
+      op.push(X(i).toFixed(1) + "," + Yo(v).toFixed(1));
+    }
+    if (oLo < 0 && oHi > 0) {
+      const y0 = Yo(0).toFixed(1);
+      g += `<line x1="${L}" y1="${y0}" x2="${L + iw}" y2="${y0}" stroke="#d9dbe6" stroke-width="0.8" stroke-dasharray="3 3"/>`;
+    }
+    g += `<polyline points="${op.join(" ")}" fill="none" stroke="#f0a020" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+  g += `<polyline points="${navPts.join(" ")}" fill="none" stroke="#5b5bd6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  g += `<circle cx="${X(n - 1).toFixed(1)}" cy="${Yn(vals[n - 1]).toFixed(1)}" r="3" fill="#5b5bd6"/>`;
+  /* 左轴：净值 */
+  g += `<text x="${L - 8}" y="${T + 4}" text-anchor="end" font-size="10" fill="#9aa0bb">${nMax.toFixed(4)}</text>`;
+  g += `<text x="${L - 8}" y="${T + ih}" text-anchor="end" font-size="10" fill="#9aa0bb">${nMin.toFixed(4)}</text>`;
+  /* 右轴：叠加指标 */
+  if (hasOv) {
+    g += `<text x="${L + iw + 8}" y="${T + 4}" font-size="10" fill="#e08b00">${oHi.toFixed(2)}</text>`;
+    g += `<text x="${L + iw + 8}" y="${T + ih}" font-size="10" fill="#e08b00">${oLo.toFixed(2)}</text>`;
+  }
+  /* 横轴日期 */
+  g += `<text x="${L}" y="${H - 8}" font-size="10" fill="#9aa0bb">${esc(dates[0].slice(5))}</text>`;
+  g += `<text x="${L + iw}" y="${H - 8}" text-anchor="end" font-size="10" fill="#9aa0bb">${esc(dates[n - 1].slice(5))}</text>`;
+  g += `</svg>`;
+  return g;
+}
+
+/* ---------- 详情页 ---------- */
+const PROD_OVS = [["a7", "7日年化"], ["a14", "14日年化"], ["wan", "万份收益"], ["none", "不叠加"]];
+
+function openProdDetail(pid) {
+  const p = DATA.products.find(x => x.id === pid);
+  if (!p) return toast("产品不存在");
+  UI.viewProd = pid;
+  if (!UI.prodRange) UI.prodRange = "3m";
+  if (!UI.prodOv) UI.prodOv = "a7";
+  renderProdDetail();
+}
+function setProdRange(btn, r) {
+  if (btn) { btn.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("on")); btn.classList.add("on"); }
+  UI.prodRange = r; renderProdDetail();
+}
+function setProdOv(btn, o) {
+  if (btn) { btn.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("on")); btn.classList.add("on"); }
+  UI.prodOv = o; renderProdDetail();
+}
+function renderProdDetail() {
+  const p = DATA.products.find(x => x.id === UI.viewProd);
+  if (!p) return;
+  const st = navStats(p);
+  const pos = position(p);
+  const n = st.dates.length;
+
+  /* 区间裁剪：先算完整序列（7日年化需要前 7 个点），再切区间 */
+  const rng = PROD_RANGES.find(x => x[0] === UI.prodRange) || PROD_RANGES[1];
+  const cut = rng[2] ? rangeStartDate(rng[2]) : "";
+  let i0 = 0, inRange = true;
+  if (cut) {
+    const k = st.dates.findIndex(d => d >= cut);
+    if (k < 0) { inRange = false; i0 = n - 1; } else i0 = k;
+  }
+  const ovKey = UI.prodOv;
+  const ovArr = ovKey === "a7" ? st.a7 : ovKey === "a14" ? st.a14 : ovKey === "wan" ? st.wan : null;
+  const ovName = (PROD_OVS.find(x => x[0] === ovKey) || [])[1] || "";
+  const ovUnit = ovKey === "wan" ? "元/万份" : "%";
+
+  const latest = n ? st.vals[n - 1] : null;
+  const latestDate = n ? st.dates[n - 1] : "";
+  const wan = lastNum(st.wan), a7 = lastNum(st.a7), a14 = lastNum(st.a14), a30 = lastNum(st.a30);
+  const since = sinceAnnual(st);
+  const navFmt = v => (v === null ? "—" : Number(v).toFixed(4));
+  const pctFmt = v => (v === null ? "—" : `${v >= 0 ? "+" : ""}${pct(v)}`);
+
+  /* 历史净值表：末 20 行 */
+  const rows = [];
+  for (let i = n - 1; i >= 0 && rows.length < 20; i--) {
+    const chg = i > 0 ? (st.vals[i] - st.vals[i - 1]) / st.vals[i - 1] : null;
+    rows.push(`<tr>
+      <td>${esc(st.dates[i].slice(5))}</td>
+      <td><b>${navFmt(st.vals[i])}</b></td>
+      <td class="${cls(chg === null ? 0 : chg)}">${chg === null ? "—" : pct(chg)}</td>
+      <td class="${cls(st.a7[i] === null ? 0 : st.a7[i])}">${st.a7[i] === null ? "—" : pct(st.a7[i])}</td>
+    </tr>`);
+  }
+
+  const chartHtml = !n
+    ? `<div class="empty">还没有净值数据。云端抓取后会自动补全，也可在「录入/查看净值」手工补录。</div>`
+    : (!inRange
+      ? `<div class="empty">所选的「${esc(rng[1])}」区间内没有净值</div>`
+      : chartBlock(st, i0, ovArr, i0));
+
+  openSheet(`<div class="sheet-t"><h3 style="font-size:15px">${esc(prodLabel(p))}</h3><button class="x" onclick="closeSheet()">✕</button></div>
+    <div class="prow" style="border-top:0;padding-top:0">
+      <div class="pn" style="font-size:12.5px">${esc(p.inst || "未填发行机构")}</div>
+      <div class="pv"></div>
+      <div class="pk">
+        ${p.code ? `<i>登记编码 <b>${esc(p.code)}</b></i>` : ""}
+        ${p.prodCode ? `<i>产品代码 <b>${esc(p.prodCode)}</b></i>` : ""}
+        ${p.riskLevel ? `<i>风险等级 <b>${esc(p.riskLevel)}</b></i>` : ""}
+        ${p.estDate ? `<i>成立日 <b>${esc(p.estDate)}</b></i>` : ""}
+      </div>
+    </div>
+
+    <div class="grid2" style="margin-top:12px">
+      <div class="stat"><div class="l">最新净值${latestDate ? "（" + esc(latestDate.slice(5)) + "）" : ""}</div><div class="v" style="color:var(--brand)">${navFmt(latest)}</div></div>
+      <div class="stat"><div class="l">万份收益（最新）</div><div class="v ${cls(wan === null ? 0 : wan)}">${wan === null ? "—" : signMoney(wan)}</div></div>
+      <div class="stat"><div class="l">近7日年化</div><div class="v ${cls(a7 === null ? 0 : a7)}">${pctFmt(a7)}</div></div>
+      <div class="stat"><div class="l">近14日年化</div><div class="v ${cls(a14 === null ? 0 : a14)}">${pctFmt(a14)}</div></div>
+      <div class="stat"><div class="l">近1月年化</div><div class="v ${cls(a30 === null ? 0 : a30)}">${pctFmt(a30)}</div></div>
+      <div class="stat"><div class="l">成立以来年化</div><div class="v ${cls(since === null ? 0 : since)}">${pctFmt(since)}</div></div>
+    </div>
+
+    ${pos.shares > 0 ? `<div class="card-t" style="margin:14px 0 8px"><h2 style="font-size:14px">我的持仓</h2></div>
+    <div class="grid2">
+      <div class="stat"><div class="l">持有金额</div><div class="v">${DATA.settings.hideAmount ? "****" : money(pos.market)}</div></div>
+      <div class="stat"><div class="l">持仓收益</div><div class="v ${cls(pos.profit)}">${signMoney(pos.profit)}</div></div>
+      <div class="stat"><div class="l">持仓份额</div><div class="v" style="font-size:15px">${pos.shares.toFixed(2)}</div></div>
+      <div class="stat"><div class="l">成本净值</div><div class="v" style="font-size:15px">${pos.shares > 0 ? (pos.cost / pos.shares).toFixed(4) : "—"}</div></div>
+    </div>` : ""}
+
+    <div class="card-t" style="margin:16px 0 8px"><h2 style="font-size:14px">净值走势</h2></div>
+    <div class="chips">
+      ${PROD_RANGES.map(([k, lab]) => `<button class="chip${UI.prodRange === k ? " on" : ""}" onclick="setProdRange(this,'${k}')">${lab}</button>`).join("")}
+    </div>
+    <div class="chips">
+      <span class="muted" style="font-size:11px;align-self:center;margin-right:2px">叠加</span>
+      ${PROD_OVS.map(([k, lab]) => `<button class="chip${UI.prodOv === k ? " on" : ""}" onclick="setProdOv(this,'${k}')">${lab}</button>`).join("")}
+    </div>
+    <div class="chart-wrap">
+      <div class="chart-legend">
+        <span><i style="background:#5b5bd6"></i>单位净值（左轴）</span>
+        ${ovArr && ovKey !== "none" ? `<span><i style="background:#f0a020"></i>${esc(ovName)}（右轴·${esc(ovUnit)}）</span>` : ""}
+      </div>
+      ${chartHtml}
+    </div>
+
+    <div class="card-t" style="margin:14px 0 8px"><h2 style="font-size:14px">历史净值</h2><span class="hint">最近 ${Math.min(20, n)} 条 / 共 ${n} 条</span></div>
+    ${rows.length ? `<table class="navtbl">
+      <thead><tr><th>日期</th><th>单位净值</th><th>日涨跌</th><th>7日年化</th></tr></thead>
+      <tbody>${rows.join("")}</tbody>
+    </table>` : `<div class="empty">暂无净值</div>`}
+
+    <div class="row-btn" style="margin-top:14px">
+      <button class="btn gh" style="flex:1" onclick="closeSheet();editProd('${p.id}')">编辑产品</button>
+      <button class="btn pri" style="flex:1" onclick="closeSheet();openNav('${p.id}')">录入净值</button>
+    </div>`);
+}
+/* 区间起点日期 */
+function rangeStartDate(days) {
+  const t = new Date();
+  t.setDate(t.getDate() - days);
+  return fmtDate(t);
+}
+/* 图表块（含区间标题） */
+function chartBlock(st, i0, ovArr, _i) {
+  const dates = st.dates.slice(i0), vals = st.vals.slice(i0);
+  const ov = ovArr ? ovArr.slice(i0) : null;
+  return svgChart(dates, vals, ov);
 }
 function openNav(pid) {
   const p = DATA.products.find(x => x.id === pid); if (!p) return;
