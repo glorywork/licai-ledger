@@ -2,7 +2,7 @@
    外壳缓存优先；数据由 GitHub 同步，不走缓存
    注意：改 app.js / index.html 后必须把下面的 CACHE 版本号 +1，
         并与 app.js 里的 APP_VER 保持一致（_test_dom.js 有断言守住）。 */
-const CACHE = "licai-ledger-v14";
+const CACHE = "licai-ledger-v15";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
@@ -44,5 +44,20 @@ self.addEventListener("fetch", e => {
       caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => { });
       return res;
     }).catch(() => caches.match("./index.html")))
+  );
+});
+
+/* 点系统通知 → 聚焦已打开的窗口，没有就新开一个。
+   没有这段的话点通知毫无反应（桌面端）或落到空白页（部分 Android）。
+   必须用 clients.matchAll：SW 里没有 window，拿不到 window.focus()。 */
+self.addEventListener("notificationclick", e => {
+  e.notification.close();
+  e.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then(list => {
+      for (const c of list) {
+        if (String(c.url).indexOf(location.origin) === 0 && "focus" in c) return c.focus();
+      }
+      if (clients.openWindow) return clients.openWindow("./");
+    })
   );
 });
