@@ -7,10 +7,16 @@
 /* ---------- 常量 ---------- */
 const LS_DATA = "licai_ledger_v1";
 const LS_SYNC = "licai_ledger_sync_v1";
+/* 通知开关与「已忽略的告警」存本机，不进 licai-data.json：
+   通知权限是「每台设备授权一次」的东西，同步过去没有意义；
+   告警的「已读」同理只对当前设备成立 —— 放进 DATA 会被 autoPush 推给别的设备，
+   反而让另一台设备漏掉该看到的提醒。 */
+const LS_NOTIFY = "licai_ledger_notify_v1";
+const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v14";
+const APP_VER = "v15";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -137,6 +143,10 @@ function fetchStatus(p) {
 */
 let DATA = { products: [], trades: [], settings: { hideAmount: false } };
 let SYNC = { owner: "", repo: "", path: "licai-data.json", token: "", sha: "", auto: true };
+/* 提醒状态（本机）：on = 用户是否开启了系统通知；lastCheck = 上次比对云端的时间戳 */
+let NOTIFY = { on: false, lastCheck: 0 };
+/* 用户已忽略的抓取告警签名（按「失败集合」生成，集合一变就重新提示） */
+let ALERT_DISMISSED = "";
 let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7", detQ: "", detInst: "", detSort: "dayP", detAsc: false };
 
 /* ---------- 工具 ---------- */
@@ -915,6 +925,7 @@ function renderSet() {
        </div>`
     : `<div class="note">尚未连接云端。配置后即可多设备共享同一份台账数据。</div>`;
   $("syncState").textContent = ok ? "已连接" : "未连接";
+  renderNotify();
 }
 
 /* ============================================================
@@ -1670,6 +1681,7 @@ function delTrade(tid) {
    ============================================================ */
 function refreshNav() {
   const last = (DATA.settings && DATA.settings.lastNavSync) || "";
+  const hf = lastFetchInfo(), hfN = fetchFailCount(hf);
   const rows = DATA.products.map(p => {
     const st = fetchStatus(p);
     return `<div class="sumline" style="align-items:flex-start">
@@ -1761,6 +1773,8 @@ async function syncPull(manual) {
     SYNC.sha = info.sha; saveSync();
     const remote = JSON.parse(decodeURIComponent(escape(atob(info.content.replace(/\n/g, "")))));
     if (manual && !confirm("用云端数据覆盖本地？本地未同步的改动将丢失。\n建议：先在另一台设备推送，或先导出本地备份。")) return;
+    /* 覆盖前留一份净值指纹，用来判断云端是不是真有新净值（见 notifyNewNav） */
+    const before = navFingerprint();
     DATA = Object.assign({ products: [], trades: [], settings: {} }, remote);
     saveLocal();
     /* 云端数据同样要过一遍迁移：合并重复产品、搬迁销售代码。
@@ -1768,6 +1782,11 @@ async function syncPull(manual) {
     const migratedRemote = migrateData();
     renderHome(); renderTrade(); renderProd(); renderSet();
     if (migratedRemote) { notifyMigrate(); autoPush(); }
+    const after = navFingerprint();
+    /* before.count 为 0 说明本机还没有任何净值（首次拉取 / 换设备），
+       拿它当基准会算出「云端有 200 条新净值」这种荒唐提示，故跳过。 */
+    if (before.count > 0) notifyNewNav(after.count - before.count, after.latest);
+    renderAlert();
     if (manual) toast(migratedRemote ? "已从云端拉取，并自动整理数据" : "已从云端拉取");
   } catch (e) {
     if (manual) toast("拉取失败：" + String(e).slice(0, 80), 3000);
@@ -1797,6 +1816,170 @@ function autoPush() {
   if (!(SYNC.owner && SYNC.repo && SYNC.token)) return;
   clearTimeout(_pushTimer);
   _pushTimer = setTimeout(() => syncPush(false), 1500);
+}
+
+/* ============================================================
+   提醒：新净值通知 + 抓取异常告警
+   ------------------------------------------------------------
+   为什么没有「真正的后台推送」：
+     本项目零后端，云端只有定时抓取的 GitHub Actions。
+     真后台推送需要 Web Push（VAPID 密钥对 + 一台常驻服务端来投递），
+     那会立刻打破「数据不出设备 + 零服务器成本」这两个前提，故不做。
+     所以提醒做成两级：
+       ① App 打开 / 切回前台时：自动比对云端文件 sha，有新净值直接提示；
+       ② 页面挂在后台（装了主屏、或留着一个标签页）时：每 60 分钟轮询一次，
+          发现新净值才发系统通知。
+     iOS：Safari 里不上主屏会直接拒绝通知权限，必须「分享 → 添加到主屏幕」
+          后从桌面图标打开（iOS 16.4+）。renderNotify 里会按环境给出提示。
+   ============================================================ */
+function loadNotify() {
+  try { const s = localStorage.getItem(LS_NOTIFY); if (s) NOTIFY = Object.assign(NOTIFY, JSON.parse(s)); } catch (e) { }
+  try { ALERT_DISMISSED = localStorage.getItem(LS_ALERT) || ""; } catch (e) { }
+}
+function saveNotify() {
+  try { localStorage.setItem(LS_NOTIFY, JSON.stringify({ on: !!NOTIFY.on, lastCheck: NOTIFY.lastCheck || 0 })); } catch (e) { }
+}
+function saveAlertDismiss() { try { localStorage.setItem(LS_ALERT, ALERT_DISMISSED); } catch (e) { } }
+
+function notifySupported() { return typeof Notification !== "undefined" && !!Notification; }
+function notifyPermission() { return notifySupported() ? Notification.permission : "unsupported"; }
+function isIOS() { return /iP(hone|ad|od)/.test(navigator.userAgent || ""); }
+function isStandalone() {
+  try {
+    return (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches)
+      || navigator.standalone === true;
+  } catch (e) { return false; }
+}
+function canNotify() { return NOTIFY.on && notifyPermission() === "granted"; }
+
+/* 发系统通知。
+   优先走 SW 的 showNotification —— iOS(16.4+) 只认这条路径，
+   `new Notification()` 在移动端 Safari 根本不存在，只作桌面浏览器的回退。
+   tag 固定：同一条提醒重复发只替换，不会在通知中心堆一串。 */
+async function pushNotify(title, body) {
+  if (!canNotify()) return false;
+  const opts = { body: body, icon: "./icon-192.png", badge: "./icon-192.png", tag: "licai-nav", lang: "zh-CN" };
+  try {
+    const reg = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
+      ? await navigator.serviceWorker.getRegistration() : null;
+    if (reg && reg.showNotification) { await reg.showNotification(title, opts); return true; }
+    new Notification(title, opts);            /* 回退：桌面浏览器 */
+    return true;
+  } catch (e) { return false; }
+}
+
+async function toggleNotify() {
+  if (NOTIFY.on) {
+    NOTIFY.on = false; saveNotify(); renderNotify();
+    toast("已关闭新净值提醒"); return;
+  }
+  if (!notifySupported()) {
+    toast("此环境不支持通知。iPhone 请先「分享 → 添加到主屏幕」，再从桌面图标打开", 4600);
+    renderNotify(); return;
+  }
+  let perm = Notification.permission;
+  if (perm === "default") {
+    try { perm = await Notification.requestPermission(); } catch (e) { perm = "denied"; }
+  }
+  if (perm !== "granted") {
+    toast("通知权限被拒绝。请到浏览器/系统设置里允许本站通知，再回来开启", 4200);
+    renderNotify(); return;
+  }
+  NOTIFY.on = true; saveNotify(); renderNotify();
+  toast("已开启提醒：" + (isStandalone() ? "退到后台也能收到通知" : "页面在后台时会有通知"), 3200);
+  pushNotify("提醒已开启", "抓到新净值、或云端抓取失败时会在这里告诉你。");
+}
+
+function renderNotify() {
+  const box = $("notifyBox"); if (!box) return;
+  const btn = $("btnNotify"), tip = $("notifyTip");
+  const supported = notifySupported(), perm = notifyPermission();
+  if (btn) btn.textContent = NOTIFY.on ? "关闭通知" : "开启通知";
+  let html = "", t = "";
+  if (!supported) {
+    html = `<div class="note">当前环境不支持系统通知（可能是 <code>file://</code> 打开、或 App 内嵌浏览器）。<br>
+            抓取异常仍会在首页顶部显示<b>告警条</b>。</div>`;
+    t = isIOS() ? "iPhone / iPad：需先用 Safari「分享 → 添加到主屏幕」，再从桌面图标打开本页，通知才会生效。" : "";
+  } else if (perm === "denied") {
+    html = `<div class="note">通知权限已被拒绝。<br>需到浏览器设置里手动允许本站通知，再回来开启。</div>`;
+  } else if (NOTIFY.on) {
+    html = `<div class="note g">已开启。${isStandalone() ? "本页已装到桌面，退到后台也能收到通知。" : "本页留在后台（或装到桌面）时能收到通知。"}</div>`;
+    t = "零后端设计：靠本页定时比对云端数据，<b>完全关闭浏览器后收不到推送</b>（那需要一台常驻服务器）。";
+  } else {
+    html = `<div class="note">开启后：抓到<b>新净值</b>、或云端<b>抓取失败</b>时会收到系统通知。<br>
+            不开启也不影响使用 —— 首页顶部仍有告警条。</div>`;
+    t = (isIOS() && !isStandalone())
+      ? "iPhone / iPad：请先「分享 → 添加到主屏幕」，再从桌面图标打开，才能开启通知。" : "";
+  }
+  box.innerHTML = html;
+  if (tip) tip.innerHTML = t;
+}
+
+/* ---------- 云端抓取健康度（云端写进 licai-data.json 的 settings.lastFetch） ---------- */
+function lastFetchInfo() {
+  const lf = DATA.settings && DATA.settings.lastFetch;
+  return (lf && typeof lf === "object") ? lf : null;
+}
+/* 告警签名只取「失败集合」，不含时间戳：
+   这样用户点掉之后不会因为下一轮抓取（时间变了）又冒出来，
+   但只要失败的产品变了、或有新的产品开始失败，就会重新提示。 */
+function fetchFailSig(lf) { return lf ? ("fetch:" + (lf.sig || "") + ":" + (Number(lf.fail) || 0)) : ""; }
+function fetchFailCount(lf) { return lf ? (Number(lf.fail) || 0) : 0; }
+
+function renderAlert() {
+  const bar = $("alertBar"); if (!bar) return;
+  const lf = lastFetchInfo();
+  const n = fetchFailCount(lf);
+  if (!n || fetchFailSig(lf) === ALERT_DISMISSED) {
+    bar.className = "alert"; bar.innerHTML = ""; return;
+  }
+  const items = (lf.items || []).slice(0, 3)
+    .map(s => `<div class="sm">· ${esc(s)}</div>`).join("");
+  const more = n > 3 ? `<div class="sm">…另有 ${n - 3} 只，点「详情」看全部</div>` : "";
+  bar.className = "alert warn show";
+  bar.innerHTML = `<div class="tx">
+      <b>云端抓取有 ${n} 只产品没拿到净值</b>${lf.time ? `<span class="sm"> · ${esc(lf.time)}</span>` : ""}
+      ${items}${more}
+      <div style="margin-top:4px"><span class="more" onclick="refreshNav()">详情与处理办法 ›</span></div>
+    </div>
+    <button class="x" title="本次不再提示" onclick="dismissAlert()">✕</button>`;
+}
+function dismissAlert() {
+  ALERT_DISMISSED = fetchFailSig(lastFetchInfo());
+  saveAlertDismiss(); renderAlert();
+  toast("已忽略本次告警。失败的产品有变化时会重新提示", 3200);
+}
+
+/* ---------- 新净值检测 ---------- */
+/* 净值指纹：最新披露日 + 净值总条数。
+   只认「条数增长」不认减少 —— 云端抓取只增不删，减少说明是别的问题（比如换了账号）。 */
+function navFingerprint() {
+  let count = 0;
+  for (const p of DATA.products) count += navCount(p);
+  return { count: count, latest: latestDateAll() || "" };
+}
+/* 拉到新净值后的提醒。
+   用户正盯着屏幕看的时候不再弹系统通知去打断他 —— 前台只给 toast。 */
+function notifyNewNav(delta, latest) {
+  if (!(delta > 0)) return;
+  if (document.visibilityState === "visible") {
+    toast(`云端有 ${delta} 条新净值（最近 ${latest}），已同步`, 3600);
+  } else {
+    pushNotify("净值已更新", `${delta} 条新净值 · 最近披露 ${latest}`);
+  }
+}
+/* 后台轮询：只比对远端 sha，变了才真拉全量。
+   15 分钟内不重复请求（GitHub API 有速率限制，而云端抓取本身一天只有两次）。 */
+async function checkCloudUpdate() {
+  if (!(SYNC.owner && SYNC.repo && SYNC.token)) return;
+  if (!NOTIFY.on) return;
+  if (Date.now() - (NOTIFY.lastCheck || 0) < 15 * 60000) return;
+  NOTIFY.lastCheck = Date.now(); saveNotify();
+  try {
+    const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
+    if (!info || !info.sha || info.sha === SYNC.sha) return;   /* 云端没变 */
+    await syncPull(false);                                    /* 变了才拉 */
+  } catch (e) { /* 静默：网络抖动不该打扰用户 */ }
 }
 
 /* ============================================================
@@ -1838,13 +2021,25 @@ function clearAll() {
    ============================================================ */
 (function init() {
   loadLocal();
+  loadNotify();
   /* 启动即做一次数据迁移：销售代码→产品代码、重复产品合并 */
   const migrated = migrateData();
   $("btnHide").textContent = DATA.settings.hideAmount ? "显示" : "隐藏";
   renderHome(); renderSet();
+  renderAlert();
   if (migrated) notifyMigrate();
   if (SYNC.owner && SYNC.repo && SYNC.token) syncPull(false);
   window.addEventListener("online", () => { if (SYNC.owner) syncPull(false); });
+
+  /* 提醒的两条触发路径（详见「提醒」章节的说明）：
+     ① 页面在后台时每 60 分钟比对一次云端版本，有新净值就发系统通知；
+     ② 从后台切回前台时立刻核对一次，并重画告警条/提醒状态（可能是在别处改过数据）。 */
+  setInterval(checkCloudUpdate, 60 * 60000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      checkCloudUpdate(); renderAlert(); renderNotify();
+    }
+  });
   /* 注册 Service Worker（仅 https / localhost 生效，file:// 下自动跳过）
      SW 是「外壳缓存优先」，新版本必须等新 SW 装上并接管才生效 ——
      否则用户会一直看到旧的 index.html / app.js，表现为「推了代码但页面没变」。
