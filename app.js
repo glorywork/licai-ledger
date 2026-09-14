@@ -7,6 +7,10 @@
 /* ---------- 常量 ---------- */
 const LS_DATA = "licai_ledger_v1";
 const LS_SYNC = "licai_ledger_sync_v1";
+/* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
+   升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
+   页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
+const APP_VER = "v10";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -518,6 +522,7 @@ function renderHome() {
   setStat("statM0r", annualize(mPrev, mPrevYear, mPrevMonth), false, true);
   setStat("statReal", pf.totalRealized, true);
   $("statCnt").textContent = pf.rows.length; $("statCnt").className = "v";
+  if ($("appVer")) $("appVer").textContent = `版本 ${APP_VER}`;
   renderCal(); renderDetail();
 }
 function setStat(id, v, isMoney, isPct) {
@@ -1324,8 +1329,31 @@ function clearAll() {
   if (migrated) notifyMigrate();
   if (SYNC.owner && SYNC.repo && SYNC.token) syncPull(false);
   window.addEventListener("online", () => { if (SYNC.owner) syncPull(false); });
-  /* 注册 Service Worker（仅 https / localhost 生效，file:// 下自动跳过） */
+  /* 注册 Service Worker（仅 https / localhost 生效，file:// 下自动跳过）
+     SW 是「外壳缓存优先」，新版本必须等新 SW 装上并接管才生效 ——
+     否则用户会一直看到旧的 index.html / app.js，表现为「推了代码但页面没变」。
+     所以这里主动监听更新：updatefound 只在真的发现新版本时触发，
+     新 SW 一装好（installed）且当前有旧 SW 在控制页面，就提示并自动刷新一次
+     （sessionStorage 里记一下，确保每个版本最多刷一次，杜绝循环刷新）。 */
   if ("serviceWorker" in navigator && location.protocol !== "file:") {
-    navigator.serviceWorker.register("./sw.js").catch(() => { });
+    const FLAG = "licai_sw_reloaded";
+    const reloadOnce = () => {
+      try {
+        if (sessionStorage.getItem(FLAG) === APP_VER) return;
+        sessionStorage.setItem(FLAG, APP_VER);
+      } catch (e) { /* 隐私模式下可能不可用，忽略 */ }
+      toast(`已更新到 ${APP_VER}，即将刷新…`);
+      setTimeout(() => location.reload(), 1000);
+    };
+    navigator.serviceWorker.register("./sw.js").then(reg => {
+      reg.addEventListener("updatefound", () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener("statechange", () => {
+          /* 首次安装时还没有 controller，不需要刷新，只有「替换旧版本」才刷 */
+          if (nw.state === "installed" && navigator.serviceWorker.controller) reloadOnce();
+        });
+      });
+    }).catch(() => { });
   }
 })();
