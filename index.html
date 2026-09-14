@@ -288,7 +288,12 @@ body{
   <!-- ========== 产品管理 ========== -->
   <div class="page" id="pg-prod">
     <div class="card">
-      <div class="card-t"><h2>我的产品</h2><button class="btn pri" style="padding:8px 14px;font-size:12.5px" onclick="openProd()">+ 添加产品</button></div>
+      <div class="card-t"><h2>我的产品</h2>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="mini" onclick="openLinkAdd()">粘贴链接</button>
+          <button class="btn pri" style="padding:8px 14px;font-size:12.5px" onclick="openProd()">+ 添加产品</button>
+        </div>
+      </div>
       <div id="prodList"></div>
     </div>
     <div class="card">
