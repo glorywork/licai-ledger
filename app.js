@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v15";
+const APP_VER = "v16";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -1794,13 +1794,35 @@ async function syncPull(manual) {
 }
 async function syncPush(manual) {
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) { if (manual) toast("请先配置同步"); return; }
-  const content = btoa(unescape(encodeURIComponent(JSON.stringify(DATA, null, 1))));
-  const body = { message: `update ledger ${new Date().toISOString().slice(0, 16)}`, content };
+  const payload = JSON.parse(JSON.stringify(DATA));
+  const body = { message: `update ledger ${new Date().toISOString().slice(0, 16)}` };
   try {
-    if (SYNC.sha) body.sha = SYNC.sha;
-    else {
+    /* 推之前先读一次远端。两个原因，都跟「整文件替换」有关：
+       ① GitHub Contents PUT 是整文件替换，而 settings 里的 lastNavSync / lastFetch
+          是**抓取脚本的**字段。如果本机副本比云端旧（Action 在我们打开页面之后
+          刚写过），直接推就把云端刚写的抓取结果覆盖回旧值 —— 表现为「云端明明
+          抓取失败了，App 的告警条却不出现」，而且不会有任何报错。
+       ② 顺手拿到最新 sha，避免用陈旧 sha 提交导致 409 冲突。 */
+    try {
+      const cur = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
+      if (cur && cur.sha) {
+        body.sha = cur.sha;
+        const rs = (JSON.parse(decodeURIComponent(escape(atob(String(cur.content).replace(/\n/g, ""))))) || {}).settings || {};
+        payload.settings = payload.settings || {};
+        for (const k of ["lastNavSync", "lastFetch"]) {
+          const a = rs[k], b = payload.settings[k];
+          /* 用 time 比较新旧；云端没有就保留本地，都没写就跳过 */
+          const ta = a ? String(a.time || a) : "";
+          const tb = b ? String(b.time || b) : "";
+          if (ta && ta > tb) payload.settings[k] = a;
+        }
+      }
+    } catch (e) { /* 读不到远端就按本地推，不阻断正常保存 */ }
+    if (!body.sha) {
       try { const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`); body.sha = info.sha; } catch (e) { }
     }
+    body.content = btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 1))));
+    DATA.settings = payload.settings;      /* 把合并后的结果留在本地，下次不必再合 */
     const res = await ghReq("PUT", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`, body);
     SYNC.sha = res && res.content ? res.content.sha : ""; saveSync();
     $("syncState").textContent = "已同步";
