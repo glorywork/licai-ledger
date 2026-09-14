@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v16";
+const APP_VER = "v17";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -1315,70 +1315,146 @@ function findDupProduct(r) {
 }
 
 function openLinkAdd() {
-  openSheet(`<div class="sheet-t"><h3>粘贴链接添加产品</h3><button class="x" onclick="closeSheet()">✕</button></div>
+  openSheet(`<div class="sheet-t"><h3>粘贴添加产品</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="note b" style="margin-bottom:12px">
-      把<b>产品页面链接</b>（银行 App / 微信里复制的那条）粘进来即可。<br>
+      把<b>产品页面链接</b>（银行 App / 微信里复制的那条）粘进来即可。<b>一行一只，可以一次贴很多行。</b><br>
       链接里带产品代码或登记编码时自动识别；若贴的是公众号文章之类的链接，
       请把<b>登记编码</b>或<b>产品代码</b>一并贴上。
     </div>
-    <div class="field"><label>粘贴链接 / 代码 / 含代码的文本</label>
-      <textarea id="lkInput" rows="3" oninput="previewLink()" placeholder="https://… 或 Z7008926000006 / YJ01251204A"
+    <div class="field"><label>粘贴链接 / 代码 / 含代码的文本（可多行）</label>
+      <textarea id="lkInput" rows="5" oninput="previewLink()" placeholder="每行一只产品，例如：&#10;https://…?PROD_CODE=YJ01251204A&#10;https://…?prodRegCode=Z7008926000006&#10;ZGN2360006C"
         style="width:100%;padding:11px 12px;border:1.5px solid var(--line);border-radius:11px;font-size:13px;font-family:inherit;color:var(--ink);outline:none;resize:vertical"></textarea>
     </div>
     <div id="lkPreview"></div>
-    <div class="field"><label>产品名称 <span class="muted">（可留空，云端抓到后自动补全）</span></label>
+    <div class="field"><label>产品名称 <span class="muted">（可留空，云端抓到后自动补全；多行粘贴时不套用）</span></label>
       <input id="lkName" placeholder="留空即可">
     </div>
-    <div class="field"><label>发行机构</label>
+    <div class="field"><label>发行机构 <span class="muted">（识别不出机构的行靠它兜底）</span></label>
       <input id="lkInst" placeholder="如 北银理财有限责任公司">
       <div class="tip">云端靠这个字段选数据源：填理财公司全名（含「理财」即可），识别出代码时会自动补上</div>
     </div>
     <div class="row-btn">
       <button class="btn gh" style="flex:1" onclick="closeSheet()">取消</button>
-      <button class="btn pri" style="flex:1" onclick="saveFromLink()">确认添加</button>
+      <button class="btn pri" style="flex:1" id="lkSave" onclick="saveFromLink()">确认添加</button>
     </div>`);
-  UI.linkParsed = null;
+  UI.linkParsed = null; UI.linkRows = null;
   previewLink();
+}
+
+/* 多行粘贴：每行当一个产品解析，**每行都有结果**（不认识的不会被静默丢掉）。
+   单行仍走原来那套更详细的说明，老用户看到的东西不变。 */
+function parseProductLines(text) {
+  const rows = [];
+  String(text == null ? "" : text).split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line) return;
+    const r = parseProductInput(line);
+    if (!r.ok) { rows.push({ ln: i + 1, raw: line, r, status: "bad", key: "", note: r.msg }); return; }
+    const dup = findDupProduct(r);
+    rows.push({
+      ln: i + 1, raw: line, r,
+      status: dup ? "dup" : "add",
+      key: r.prodCode || r.code,
+      inst: ORG_NAME[r.org] || "",
+      note: dup ? `已存在「${prodLabel(dup)}」` : (ORG_NAME[r.org] || "识别不出机构，需手填机构名"),
+    });
+  });
+  return rows;
+}
+
+/* 按钮文案跟着预览走：写「确认添加 N 只」就只会加这 N 只 */
+function setLinkSave(n) {
+  const b = $("lkSave"); if (!b) return;
+  b.textContent = n ? `确认添加 ${n} 只` : "没有可添加的产品";
+  b.disabled = !n;
 }
 
 function previewLink() {
   const box = $("lkPreview"); if (!box) return;
-  const r = parseProductInput($("lkInput") ? $("lkInput").value : "");
-  UI.linkParsed = r;
+  const text = $("lkInput") ? $("lkInput").value : "";
+  const rows = parseProductLines(text);
+  UI.linkRows = rows;
+  const single = rows.length === 1 ? rows[0] : null;
+  UI.linkParsed = single ? single.r : parseProductInput(text);
   const instEl = $("lkInst");
-  /* ★ 机构必须落进 inst：云端 detect_org 靠它判机构（见本段顶部契约说明） */
-  if (r.org && instEl && !instEl.value.trim()) instEl.value = ORG_NAME[r.org] || "";
-  if (!r.ok) {
-    box.innerHTML = `<div class="note" style="margin-bottom:12px">${esc(r.msg)}</div>`;
+  /* 单行时把识别出的机构自动补上；多行不自动填 —— 各家机构不同，填一个是误导。
+     ★ 机构必须落进 inst：云端 detect_org 靠它判机构（见本段顶部契约说明） */
+  if (single && single.inst && instEl && !instEl.value.trim()) instEl.value = single.inst;
+
+  if (!rows.length) {
+    setLinkSave(0);
+    box.innerHTML = `<div class="note" style="margin-bottom:12px">${esc(UI.linkParsed.msg || "请粘贴产品链接、产品代码或登记编码")}</div>`;
     return;
   }
-  const dup = findDupProduct(r);
-  const lines = [];
-  if (r.code) lines.push(`登记编码 <b>${esc(r.code)}</b>`);
-  if (r.prodCode) lines.push(`产品代码 <b>${esc(r.prodCode)}</b>`);
-  if (r.org) lines.push(`识别机构 <b>${esc(ORG_NAME[r.org] || r.org)}</b>`);
-  box.innerHTML = `<div class="note${dup ? "" : " g"}" style="margin-bottom:12px">
-    ${lines.join(" · ")}<br>
-    ${dup ? `⚠️ 已存在同代码产品「${esc(prodLabel(dup))}」，无需重复添加`
-      : "保存后同步到云端，下一次抓取自动补全产品名称与历史净值。"}
-  </div>`;
+  if (single) {
+    const r = single.r;
+    const dup = single.status === "dup" ? findDupProduct(r) : null;
+    const parts = [];
+    if (r.code) parts.push(`登记编码 <b>${esc(r.code)}</b>`);
+    if (r.prodCode) parts.push(`产品代码 <b>${esc(r.prodCode)}</b>`);
+    if (r.org) parts.push(`识别机构 <b>${esc(ORG_NAME[r.org] || r.org)}</b>`);
+    box.innerHTML = `<div class="note${dup ? "" : " g"}" style="margin-bottom:12px">
+      ${parts.join(" · ")}<br>
+      ${dup ? `⚠️ 已存在同代码产品「${esc(prodLabel(dup))}」，无需重复添加`
+        : "保存后同步到云端，下一次抓取自动补全产品名称与历史净值。"}
+    </div>`;
+    setLinkSave(dup ? 0 : 1);
+    return;
+  }
+  const c = { add: 0, dup: 0, bad: 0 };
+  rows.forEach(x => { c[x.status] = (c[x.status] || 0) + 1; });
+  box.innerHTML = `<div class="note${c.add ? " g" : ""}" style="margin-bottom:12px">
+      <b style="color:var(--brand)">${c.add}</b> 只可添加&nbsp;&nbsp;
+      <b style="color:var(--ink3)">${c.dup}</b> 只已存在&nbsp;&nbsp;
+      <b style="color:var(--gold)">${c.bad}</b> 行无法识别
+    </div>
+    <div style="max-height:200px;overflow:auto"><table class="navtbl">
+      <thead><tr><th>产品键</th><th style="text-align:left">机构 / 说明</th></tr></thead>
+      <tbody>${rows.slice(0, 40).map(x => `<tr>
+        <td>${esc(x.key || "—")}</td>
+        <td style="text-align:left;font-size:11px;color:var(${x.status === "bad" ? "--gold" : "--ink3"})">${esc(x.note)}</td>
+      </tr>`).join("")}</tbody></table></div>
+    ${rows.length > 40 ? `<div class="muted" style="font-size:11px;padding:6px 0">只显示前 40 行（共 ${rows.length} 行）</div>` : ""}`;
+  setLinkSave(c.add);
 }
 
 function saveFromLink() {
-  const r = UI.linkParsed || parseProductInput($("lkInput") ? $("lkInput").value : "");
-  if (!r.ok) return toast(r.msg || "没识别出产品代码或登记编码");
-  if (findDupProduct(r)) return toast("已存在同代码产品，无需重复添加");
-  const inst = ($("lkInst").value || "").trim() || (ORG_NAME[r.org] || "");
-  if (!inst) return toast("请填写发行机构（如 招银理财）—— 云端据此选择数据源");
-  const name = ($("lkName").value || "").trim();   /* 允许留空：留给云端 merge_nav 回填 */
-  const target = {
-    id: uid(), navHistory: {}, createdAt: Date.now(),
-    code: r.code || "", prodCode: r.prodCode || "", name, inst, fromLink: true,
-  };
-  DATA.products.push(target);
+  /* 用预览时那份解析结果 —— 按钮上写多少只，就只加多少只 */
+  const rows = UI.linkRows || parseProductLines($("lkInput") ? $("lkInput").value : "");
+  const adds = rows.filter(x => x.status === "add");
+  if (!adds.length) {
+    const dupN = rows.filter(x => x.status === "dup").length;
+    return toast(dupN ? `已存在的 ${dupN} 只无需重复添加` : "没有可添加的产品");
+  }
+  const manualInst = ($("lkInst").value || "").trim();
+  const name = ($("lkName").value || "").trim();     /* 允许留空：留给云端 merge_nav 回填 */
+  let ok = 0, noInst = 0;
+  for (const x of adds) {
+    const inst = x.inst || manualInst;
+    if (!inst) { noInst++; continue; }               /* 没机构云端选不了数据源，加了也是废条 */
+    if (findDupProduct(x.r)) continue;               /* 同一批里重复的代码，第二条在这里被挡下 */
+    DATA.products.push({
+      id: uid(), navHistory: {}, createdAt: Date.now(),
+      code: x.r.code || "", prodCode: x.r.prodCode || "",
+      name: rows.length === 1 ? name : "",           /* 多行粘贴不套用同一个名称 */
+      inst, fromLink: true,
+    });
+    ok++;
+  }
+  if (!ok) {
+    return toast(noInst
+      ? `请填写发行机构（如 招银理财）—— 云端据此选择数据源（${noInst} 只缺机构）`
+      : "没有可添加的产品", 4200);
+  }
   saveLocal(); closeSheet();
-  const st = fetchStatus(target);
-  toast(`已添加${st.ok ? "，" + st.txt : "。" + st.txt}。云端抓取后会自动补全名称与净值`, st.ok ? 3200 : 4400);
+  if (rows.length === 1 && ok === 1) {
+    const st = fetchStatus(DATA.products[DATA.products.length - 1]);
+    toast(`已添加${st.ok ? "，" + st.txt : "。" + st.txt}。云端抓取后会自动补全名称与净值`, st.ok ? 3200 : 4400);
+  } else {
+    const skipped = adds.length - ok;
+    toast(`已添加 ${ok} 只` + (skipped ? `，跳过 ${skipped} 只（缺机构或已存在）` : "")
+      + "。云端抓取后会自动补全名称与净值", 4400);
+  }
   renderProd(); renderHome();
   autoPush();
 }
@@ -1620,9 +1696,117 @@ function chartBlock(st, i0, ovArr, _i) {
   const ov = ovArr ? ovArr.slice(i0) : null;
   return svgChart(dates, vals, ov);
 }
+/* ============================================================
+   批量粘贴文本解析（净值 / 产品）
+   ------------------------------------------------------------
+   为什么要有这套：参考项目用「截图 OCR 记账」，但那需要服务端、且要把
+   截图交给第三方，与本项目「数据不出设备 + 零后端」的前提冲突。
+   替代方案：让用户把官网 / 银行 App / 表格里的**文字**复制进来，本地解析。
+
+   四条铁律（都是被旧 bulkNav 的毛病逼出来的，改的时候别退回去）：
+     1. **不静默丢行**。旧实现只报「已导入 N 条」，用户根本不知道还有
+        M 行没进去。现在无法识别的行必须逐条列出原因。
+     2. **不猜**。缺年份、含千分位逗号、百分数一律拒绝并说明 —— 净值写错
+        比少写严重得多（错值会一直参与收益计算，且很难被发现）。
+     3. **与云端「已有净值不覆盖」同口径**。旧实现直接覆盖同日已有值，
+        与云端 merge_nav 的策略是矛盾的。现在默认跳过，覆盖需显式勾选。
+     4. **预览里的数字就是将要写入的数字**，核对之后才落库。
+   ============================================================ */
+
+/* 一行里的日期：支持 2026-09-14 / 2026/9/14 / 2026.09.14 / 2026年9月14日 / 20260914 */
+const NAV_DATE_RES = [
+  /(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?/,
+  /(?:^|\D)(\d{4})(\d{2})(\d{2})(?!\d)/,
+];
+function navDateAt(line) {
+  for (const re of NAV_DATE_RES) {
+    const m = String(line).match(re);
+    if (!m) continue;
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+    /* 反向校验：挡掉「格式对但日期不存在」的假日期（如 2026-02-30） */
+    const dt = new Date(y, mo - 1, d);
+    if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) continue;
+    return { end: m.index + m[0].length, date: `${y}-${pad(mo)}-${pad(d)}` };
+  }
+  return null;
+}
+
+/* 日期之后的第一个「干净数字」= 单位净值。
+   含逗号 / 百分号 / 多个小数点的一律报错而不是凑一个数出来（旧实现的
+   `[\d.]+` 会把 "1,0234" 吃成 1、把 "1.0.2" 变成 NaN 写进库）。 */
+function navValueAfter(line, endIdx) {
+  const toks = String(line).slice(endIdx).split(/[\s|│]+/).filter(Boolean);
+  if (!toks.length) return { err: "只有日期，没找到净值" };
+  for (const tk of toks) {
+    if (/[，,]/.test(tk) && /^[\d,，.]+$/.test(tk))
+      return { err: `「${tk}」含千分位逗号，无法确定真实数值（只贴「日期 + 单位净值」两列最稳）` };
+    if (/%$/.test(tk)) return { err: `「${tk}」是百分数（年化或涨跌幅），不是单位净值` };
+    const m = tk.match(/^[¥￥]?(\d+(?:\.\d+)?)$/);
+    if (!m) continue;
+    const v = Number(m[1]);
+    if (!Number.isFinite(v) || v <= 0) return { err: `净值「${tk}」不是正数` };
+    if (v >= 1000) return { err: `净值「${tk}」明显不合理（≥1000）` };
+    return { nav: v, tok: tk };
+  }
+  return { err: "日期后面没找到可当作单位净值的数字" };
+}
+
+/* 解析整段文本。返回 { rows, counts }：**每一行都在 rows 里**，一行都不会消失。 */
+function parseNavText(text, existing) {
+  const exist = existing || {};
+  const rows = [], seenAt = {};
+  String(text == null ? "" : text).split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line) return;                                  /* 空行不占报告 */
+    const ln = i + 1;
+    /* 表头行（「净值日期 单位净值 日涨跌」之类）：没有日期也不是数据 */
+    if (!navDateAt(line) && /(日期|净值|年化|涨跌)/.test(line) && !/\d{4}/.test(line)) return;
+    const d = navDateAt(line);
+    if (!d) { rows.push({ ln, raw: line, status: "bad", note: "没识别出日期（支持 2026-09-14 / 2026/9/14 / 2026年9月14日 / 20260914）" }); return; }
+    const v = navValueAfter(line, d.end);
+    if (v.err) { rows.push({ ln, raw: line, date: d.date, status: "bad", note: v.err }); return; }
+    if (seenAt[d.date]) { rows.push({ ln, raw: line, date: d.date, nav: v.nav, status: "bad", note: `与第 ${seenAt[d.date]} 行日期重复` }); return; }
+    seenAt[d.date] = ln;
+    const old = exist[d.date];
+    if (old !== undefined && old !== null && old !== "") {
+      rows.push({
+        ln, raw: line, date: d.date, nav: v.nav, old: Number(old), status: "exist",
+        note: Number(old) === v.nav ? "该日期已有相同值" : `该日期已有 ${Number(old)}`,
+      });
+      return;
+    }
+    rows.push({ ln, raw: line, date: d.date, nav: v.nav, status: "new", note: "" });
+  });
+
+  /* 可疑值：与该产品最近一条已有净值、或同批的相邻条目相差 > 10%。
+     理财产品单日净值波动几乎不可能到这个量级，出现基本就是**粘错了产品**。 */
+  const keys = Object.keys(exist).sort();
+  const ref = keys.length ? Number(exist[keys[keys.length - 1]]) : null;
+  const ordered = rows.filter(r => r.date && (r.status === "new" || r.status === "exist"))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  ordered.forEach((r, i) => {
+    const prev = i > 0 ? ordered[i - 1].nav : ref;
+    if (!prev) return;
+    const diff = Math.abs(r.nav / prev - 1);
+    if (diff > 0.10) {
+      const txt = `与相邻净值 ${prev} 相差 ${(diff * 100).toFixed(1)}%`;
+      if (r.status === "new") { r.status = "warn"; r.note = txt; }
+      else r.note += `；${txt}`;
+    }
+  });
+
+  const counts = { new: 0, exist: 0, warn: 0, bad: 0 };
+  rows.forEach(r => { counts[r.status] = (counts[r.status] || 0) + 1; });
+  return { rows, counts };
+}
+
 function openNav(pid) {
   const p = DATA.products.find(x => x.id === pid); if (!p) return;
   const s = navSeries(p).slice().reverse();
+  /* 草稿留在一个模块级变量里：写入/删除一条净值会重画整个弹层，
+     若每次都清空粘贴框，用户得把上百行重新贴一遍。 */
+  const draft = UI.navDraft || "";
   openSheet(`<div class="sheet-t"><h3>${esc(prodLabel(p))} · 净值</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="field"><label>新增/修改净值</label>
       <div class="two">
@@ -1631,13 +1815,19 @@ function openNav(pid) {
       </div>
       <button class="btn pri full" style="margin-top:9px" onclick="addNav('${pid}')">保存净值</button>
     </div>
-    <div class="field"><label>批量粘贴净值（每行：日期 净值）</label>
-      <textarea id="nBulk" rows="4" style="width:100%;padding:10px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;font-size:13px" placeholder="2026-09-10 1.0313&#10;2026-09-09 1.0312"></textarea>
-      <button class="btn gh full" style="margin-top:9px" onclick="bulkNav('${pid}')">批量导入</button>
+    <div class="field"><label>批量粘贴净值 <span class="muted">（每行：日期 + 单位净值）</span></label>
+      <textarea id="nBulk" rows="5" oninput="bulkNav('${pid}')" placeholder="2026-09-10 1.0313&#10;2026-09-09 1.0312&#10;也支持 2026/9/9、2026年9月9日、20260909&#10;可直接整段复制官网的净值表">${esc(draft)}</textarea>
+      <div class="chk-row">
+        <label><input type="checkbox" id="nBulkOver" onchange="bulkNav('${pid}')"> 覆盖同日已有净值</label>
+        <label><input type="checkbox" id="nBulkWarn" onchange="bulkNav('${pid}')"> 写入可疑行</label>
+      </div>
+      <div id="nBulkPrev"></div>
     </div>
     <div class="field"><label>已有净值（${s.length} 条）</label>
       <div style="max-height:200px;overflow:auto">${s.map(([d, v]) => `<div class="sumline"><span class="k">${d}</span><span style="display:flex;gap:10px;align-items:center"><b>${Number(v).toFixed(4)}</b><button class="mini" style="padding:2px 7px;font-size:10.5px" onclick="delNav('${pid}','${d}')">删</button></span></div>`).join("") || `<span class="muted" style="font-size:12px">暂无</span>`}</div>
     </div>`);
+  /* 草稿非空时立刻把预览画出来：写入/删除后弹层会重画，预览不能跟着丢 */
+  bulkNav(pid);
 }
 function addNav(pid) {
   const p = DATA.products.find(x => x.id === pid);
@@ -1646,15 +1836,66 @@ function addNav(pid) {
   p.navHistory = p.navHistory || {}; p.navHistory[d] = v;
   saveLocal(); toast("净值已保存"); openNav(pid); renderHome(); renderProd(); autoPush();
 }
+/* 粘贴 → 解析 → 画预览。**不写库**；文本框 oninput 与两个开关都走这里。 */
 function bulkNav(pid) {
-  const p = DATA.products.find(x => x.id === pid);
-  const lines = $("nBulk").value.split("\n"); let n = 0;
+  const p = DATA.products.find(x => x.id === pid); if (!p) return;
+  if ($("nBulk")) UI.navDraft = $("nBulk").value;
+  const st = parseNavText(UI.navDraft || "", p.navHistory || {});
+  UI.navParsed = st;
+  const over = !!($("nBulkOver") && $("nBulkOver").checked);
+  const inclWarn = !!($("nBulkWarn") && $("nBulkWarn").checked);
+  const box = $("nBulkPrev"); if (!box) return;
+  const writable = st.rows.filter(r =>
+    r.status === "new" || (r.status === "warn" && inclWarn) || (r.status === "exist" && over));
+  if (!st.rows.length) { box.innerHTML = ""; return; }
+  const c = st.counts;
+  /* 颜色直接引用 CSS 变量，避免依赖可能不存在的类名 */
+  const chip = (n, col, lab) => n ? `<b style="color:var(${col})">${n}</b> ${lab}&nbsp;&nbsp;` : "";
+  box.innerHTML = `<div class="note${writable.length ? " g" : ""}" style="margin:9px 0 8px">
+      ${chip(c["new"], "--brand", "条新增")}${chip(c.warn, "--gold", "条可疑")}
+      ${chip(c.exist, "--ink3", "条已存在")}${chip(c.bad, "--gold", "行无法识别")}
+      <div style="margin-top:4px">${writable.length
+      ? `将写入 <b>${writable.length}</b> 条`
+      : "没有可写入的内容"}</div>
+      ${(c.exist && !over) ? "<div>· 已存在的日期默认跳过（勾上面的开关可覆盖）</div>" : ""}
+      ${(c.warn && !inclWarn) ? "<div>· 可疑行默认不写入 —— 请先核对是不是粘错了产品</div>" : ""}
+      ${c.bad ? "<div>· 无法识别的行会保留在输入框里，改完再点一次</div>" : ""}
+    </div>
+    <div style="max-height:230px;overflow:auto"><table class="navtbl">
+      <thead><tr><th>日期</th><th>净值</th><th style="text-align:left">说明</th></tr></thead>
+      <tbody>${st.rows.slice(0, 60).map(r => `<tr>
+        <td>${esc(r.date || "—")}</td>
+        <td>${r.nav === undefined ? "—" : Number(r.nav).toFixed(4)}</td>
+        <td style="text-align:left;font-size:11px;color:var(${r.status === "bad" ? "--gold" : "--ink3"})">${esc(r.note || "")}</td>
+      </tr>`).join("")}</tbody></table>
+      ${st.rows.length > 60 ? `<div class="muted" style="font-size:11px;padding:6px 0">只显示前 60 行（共 ${st.rows.length} 行，写入时会全部处理）</div>` : ""}
+    </div>
+    <button class="btn pri full" style="margin-top:9px" onclick="commitNav('${pid}')"${writable.length ? "" : " disabled"}>确认写入 ${writable.length} 条</button>`;
+}
+
+/* 预览确认后真正落库。写入条数必须等于按钮上写的那个数字。 */
+function commitNav(pid) {
+  const p = DATA.products.find(x => x.id === pid); if (!p) return;
+  const st = UI.navParsed || parseNavText(UI.navDraft || "", p.navHistory || {});
+  const over = !!($("nBulkOver") && $("nBulkOver").checked);
+  const inclWarn = !!($("nBulkWarn") && $("nBulkWarn").checked);
+  const doRows = st.rows.filter(r =>
+    r.status === "new" || (r.status === "warn" && inclWarn) || (r.status === "exist" && over));
+  if (!doRows.length) return toast("没有可写入的净值");
   p.navHistory = p.navHistory || {};
-  for (const ln of lines) {
-    const m = ln.trim().match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})\D+([\d.]+)/);
-    if (m) { const d = m[1].replace(/\//g, "-").replace(/-(\d)\b/g, "-0$1").replace(/\b(\d)-/g, "0$1-"); p.navHistory[d] = Number(m[2]); n++; }
+  let add = 0, cov = 0;
+  for (const r of doRows) {
+    if (r.status === "exist") cov++; else add++;
+    p.navHistory[r.date] = r.nav;          /* r.nav 已在解析阶段校验为「正的有限数」 */
   }
-  saveLocal(); toast(`已导入 ${n} 条`); openNav(pid); renderHome(); renderProd(); autoPush();
+  /* 未识别的行留在草稿里 —— 别让用户回原文里再挑一遍 */
+  const left = st.rows.filter(r => r.status === "bad").map(r => r.raw).join("\n");
+  UI.navDraft = left;
+  saveLocal(); autoPush();
+  openNav(pid);                            /* 重画：净值列表已更新，框里只剩未识别的行 */
+  renderHome(); renderProd();
+  toast(`已写入 ${add + cov} 条` + (cov ? `（覆盖 ${cov}）` : "")
+    + (left ? `，${st.counts.bad} 行未识别已留在框里` : ""), 3400);
 }
 function delNav(pid, d) {
   const p = DATA.products.find(x => x.id === pid); delete p.navHistory[d];
