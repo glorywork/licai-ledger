@@ -298,12 +298,25 @@ function navOnOrBefore(p, date) {
 }
 /* 最新净值 */
 function latestNav(p) { const s = navSeries(p); return s.length ? s[s.length - 1] : null; }
+/* 统一「当天命中 → 否则向前取最近」的取值：始终返回 [日期, 净值] 或 null。
+   ⚠️ 不要写成 `navAt(p,d) || navOnOrBefore(p,d)`：navAt 命中时返回的是「数字」，
+   navOnOrBefore 返回的是「数组」，|| 短路会让调用方拿到两种类型 ——
+   命中路径下 hit[1] 取到 undefined，Number(undefined) = NaN，
+   再被下游 `nav > 0` 之类的守卫静默退化成 0，表现为「净值栏被清空 / 份额算成 0」。 */
+function navHit(p, date) {
+  const v = navAt(p, date);
+  if (v !== undefined && v !== null && v !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return [date, n];
+  }
+  return navOnOrBefore(p, date);
+}
 
 /* 某交易发生的确认净值：优先用户填的，否则取确认日（或买入日）当天净值 */
 function resolveTradeNav(t, p) {
   if (t.confirmNav) return Number(t.confirmNav);
   const d = t.confirmNavDate || t.confirmDate || t.tradeDate;
-  const hit = navAt(p, d) || navOnOrBefore(p, d);
+  const hit = navHit(p, d);
   return hit ? Number(hit[1]) : 0;
 }
 
@@ -751,7 +764,7 @@ function renderTradeForm2() {
 function autoFillNav() {
   const p = DATA.products.find(x => x.id === UI.activePick); if (!p) return;
   const d = $("tNavDate").value;
-  const hit = navAt(p, d) || navOnOrBefore(p, d);
+  const hit = navHit(p, d);
   if (hit) $("tNav").value = Number(hit[1]).toFixed(4);
 }
 function calcShares() {
