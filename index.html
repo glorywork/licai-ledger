@@ -198,6 +198,15 @@ body{
 @keyframes sp{to{transform:rotate(360deg)}}
 .hide{display:none!important}
 .page{display:none} .page.on{display:block}
+/* 抓取异常告警条：挂在页面之外（所有页面之上），问题未处理前一直可见 */
+.alert{display:none;align-items:flex-start;gap:8px;margin:0 0 10px;padding:9px 11px;border-radius:12px;font-size:12px;line-height:1.6;border:1px solid transparent;text-align:left}
+.alert.show{display:flex}
+.alert.warn{background:#fff4e5;border-color:#f0dcb4;color:#7a5600}
+.alert .tx{flex:1;min-width:0}
+.alert .sm{opacity:.82;font-size:11px}
+.alert .more{text-decoration:underline;cursor:pointer}
+.alert .x{border:0;background:transparent;color:inherit;opacity:.55;font-size:13px;line-height:1;padding:0 2px;cursor:pointer;font-family:inherit}
+.alert .x:hover{opacity:1}
 .foot{text-align:center;font-size:10.5px;color:var(--ink3);padding:8px 4px 0;line-height:1.7}
 .sumline{display:flex;justify-content:space-between;font-size:12.5px;padding:7px 0;border-bottom:1px dashed var(--line)}
 .sumline:last-child{border:0;font-weight:700}
@@ -212,6 +221,9 @@ body{
     <h1>个人理财台账</h1>
     <span class="sync-state" id="syncState" onclick="openSync()">未连接</span>
   </div>
+
+  <!-- 云端抓取异常告警（有失败才显示；内容由 renderAlert() 填） -->
+  <div class="alert" id="alertBar"></div>
 
   <!-- ========== 首页 ========== -->
   <div class="page on" id="pg-home">
@@ -333,6 +345,12 @@ body{
       <div class="card-t"><h2>数据同步（GitHub 私有仓库）</h2></div>
       <div id="setSyncBox"></div>
       <button class="btn gh full" style="margin-top:12px" onclick="openSync()">配置同步</button>
+    </div>
+    <div class="card">
+      <div class="card-t"><h2>新净值提醒</h2></div>
+      <div id="notifyBox"></div>
+      <button class="btn gh full" style="margin-top:10px" id="btnNotify" onclick="toggleNotify()">开启通知</button>
+      <div class="foot" style="text-align:left;padding-top:9px" id="notifyTip"></div>
     </div>
     <div class="card">
       <div class="card-t"><h2>备份与恢复</h2></div>
