@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v17";
+const APP_VER = "v18";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -501,12 +501,30 @@ function monthProfit(y, m) {
   return s;
 }
 
-/* 组合年化（本月）：月收益 / 当前市值 × 365 / 当月在册天数 */
+/* 某日的组合市值（截至该日已确认份额 × 该日最近净值）—— 年化分母用，
+   不能拿今天的市值去折算历史月份（当月加仓会把上月年化压低） */
+function marketOn(endDate) {
+  let s = 0;
+  for (const p of DATA.products) {
+    const sh = sharesOn(p, endDate);
+    if (sh <= 0) continue;
+    const b = navOnOrBefore(p, endDate);
+    if (!b) continue;
+    s += sh * Number(b[1]);
+  }
+  return s;
+}
+
+/* 组合年化（本月/上月）：区间收益 / 该月末市值 × 365 / 在册天数 */
 function annualize(profit, y, m) {
-  const { totalAsset } = portfolio();
-  const days = new Date().getMonth() + 1 === m && new Date().getFullYear() === y ? Math.max(new Date().getDate(), 1) : new Date(y, m, 0).getDate();
-  if (totalAsset <= 0 || days <= 0) return 0;
-  return (profit / totalAsset) * 365 / days;
+  const cur = new Date();
+  const isCur = cur.getMonth() + 1 === m && cur.getFullYear() === y;
+  const end = isCur ? today()
+    : `${y}-${pad(m)}-${pad(new Date(y, m, 0).getDate())}`;
+  const denom = marketOn(end);
+  const days = isCur ? Math.max(cur.getDate(), 1) : new Date(y, m, 0).getDate();
+  if (denom <= 0 || days <= 0) return 0;
+  return (profit / denom) * 365 / days;
 }
 
 /* ============================================================
@@ -793,13 +811,15 @@ function renderDetailBody() {
   if (UI.detTab === "pending") { $("detBody").innerHTML = pendingHtml(list); return; }
   if (UI.detTab === "closed") { $("detBody").innerHTML = closedHtml(list); return; }
 
-  /* 当日盈亏：仅当该日有净值更新时计入（见 dayProfit 的说明） */
+  /* 当日盈亏：仅当该日有净值更新时计入（见 dayProfit 的说明）。
+     份额必须用「截至该日已确认」的 sharesOn(p, date) —— r.pos.shares 是今天的
+     份额，选历史日期时会放大、清仓产品会错误显示 0（与 dayProfit 同口径）。 */
   const rows = list.map(r => {
     const s0 = navSeries(r.p);
     const idx = s0.findIndex(x => x[0] === date);
     return {
       r, pos: r.pos,
-      dayP: idx > 0 ? r.pos.shares * (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0,
+      dayP: idx > 0 ? sharesOn(r.p, date) * (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0,
       dayNavChange: idx > 0 ? (Number(s0[idx][1]) - Number(s0[idx - 1][1])) : 0,
     };
   });
@@ -1463,19 +1483,32 @@ function saveFromLink() {
    产品详情：单位净值曲线 + 叠加指标（7日年化 / 万份收益）
    ------------------------------------------------------------
    口径（与设置页「口径说明」一致，勿私下改）：
-     · 万份收益(元) = (今日净值 − 昨日净值) × 10000
-     · N 日年化     = (nav[t] / nav[t−N] − 1) / N × 365
+     · 万份收益(元) = (今日净值 − 昨日披露净值) × 10000 ÷ 相隔自然日数
+       （周末/节假日净值为「几天累计」，按自然日均摊回每日）
+     · N 日年化     = (nav[t] ÷ N 个自然日前最近净值 − 1) ÷ N × 365
      · 成立以来年化 = (末值 / 首值 − 1) / 持有天数 × 365
    全部即时计算、不落盘。图表为内联 SVG 自绘，不引任何库/CDN。
    ============================================================ */
 const PROD_RANGES = [["1m", "近1月", 30], ["3m", "近3月", 90], ["6m", "近6月", 180], ["1y", "近1年", 365], ["all", "成立来", 0]];
 
-/* N 日年化序列（前 N 个点无值 → null，保证与净值序列一一对齐） */
-function annualNArr(vals, n) {
+/* YYYY-MM-DD ± days（自然日），返回同格式 */
+function dateShift(ymd, days) {
+  const d = parseDate(ymd);
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+/* N 日年化序列（与净值序列等长对齐；基准 = N 个自然日前最近的一条披露净值。
+   旧实现按「前 N 条披露」回退，工作日披露下 7 条 ≈ 9-10 天再 ÷7，年化系统性高估
+   约 30% —— 2026-09-15 审查修正为自然日锚定。样本不足处 null，绝不伪造。） */
+function annualNArr(dates, vals, n) {
   return vals.map((v, i) => {
     if (i < n) return null;
-    const a = Number(vals[i - n]);
-    return a > 0 ? (v / a - 1) / n * 365 : null;
+    const bd = dateShift(dates[i], -n);
+    let base = null;
+    for (let j = i; j >= 0; j--) {
+      if (dates[j] <= bd) { base = Number(vals[j]); break; }
+    }
+    return base > 0 ? (v / base - 1) / n * 365 : null;
   });
 }
 /* 一组净值指标（全部与 vals 等长对齐） */
@@ -1483,9 +1516,13 @@ function navStats(p) {
   const s = navSeries(p);
   const dates = s.map(x => x[0]);
   const vals = s.map(x => Number(x[1]));
-  /* 万份收益：首日无前值 */
-  const wan = vals.map((v, i) => (i === 0 ? null : (v - Number(vals[i - 1])) * 10000));
-  return { dates, vals, wan, a7: annualNArr(vals, 7), a14: annualNArr(vals, 14), a30: annualNArr(vals, 30) };
+  /* 万份收益：首日无前值；跨周末按自然日均摊（周一不再显示 3 天累计派息） */
+  const wan = vals.map((v, i) => {
+    if (i === 0) return null;
+    const days = Math.max(dayDiff(dates[i - 1], dates[i]), 1);
+    return (v - Number(vals[i - 1])) * 10000 / days;
+  });
+  return { dates, vals, wan, a7: annualNArr(dates, vals, 7), a14: annualNArr(dates, vals, 14), a30: annualNArr(dates, vals, 30) };
 }
 /* 成立以来年化（单一数值） */
 function sinceAnnual(stats) {
@@ -2026,7 +2063,7 @@ async function syncPull(manual) {
     const after = navFingerprint();
     /* before.count 为 0 说明本机还没有任何净值（首次拉取 / 换设备），
        拿它当基准会算出「云端有 200 条新净值」这种荒唐提示，故跳过。 */
-    if (before.count > 0) notifyNewNav(after.count - before.count, after.latest);
+    if (before.count > 0) notifyNewNav(navDeltaSince(before.latest), after.latest);
     renderAlert();
     if (manual) toast(migratedRemote ? "已从云端拉取，并自动整理数据" : "已从云端拉取");
   } catch (e) {
@@ -2220,6 +2257,15 @@ function navFingerprint() {
   let count = 0;
   for (const p of DATA.products) count += navCount(p);
   return { count: count, latest: latestDateAll() || "" };
+}
+/* 比上次同步更新的净值条数（披露日 > latestDate）。
+   不能用总条数差：新增产品回填 122 条历史会被误报成「122 条新净值」。 */
+function navDeltaSince(latestDate) {
+  let n = 0;
+  for (const p of DATA.products)
+    for (const d in (p.navHistory || {}))
+      if (d > latestDate) n++;
+  return n;
 }
 /* 拉到新净值后的提醒。
    用户正盯着屏幕看的时候不再弹系统通知去打断他 —— 前台只给 toast。 */
