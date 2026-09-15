@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v18";
+const APP_VER = "v19";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -173,15 +173,23 @@ function toast(msg, ms = 2000) {
   clearTimeout(t._tm); t._tm = setTimeout(() => t.classList.remove("show"), ms);
 }
 function dayDiff(a, b) { return Math.round((parseDate(b) - parseDate(a)) / 86400000); }
-/* 两个日期之间的工作日数（扣周末，不含节假日——已知限制） */
-function workdaysBetween(a, b) {
-  let n = 0; const d = parseDate(a); const end = parseDate(b);
-  while (d < end) { d.setDate(d.getDate() + 1); const w = d.getDay(); if (w !== 0 && w !== 6) n++; }
-  return n;
-}
+/* ---------- 持久化 ---------- */
+/* （workdaysBetween 已删除：定义后从未被调用，且容易让人误以为 T+1 用工作日口径 —— 2026-09-15 审查清理） */
 
 /* ---------- 持久化 ---------- */
-function saveLocal() { try { localStorage.setItem(LS_DATA, JSON.stringify(DATA)); } catch (e) { } }
+let STORAGE_BAD = false;   /* 只提示一次，成功后自动复位 */
+function saveLocal() {
+  try {
+    localStorage.setItem(LS_DATA, JSON.stringify(DATA));
+    if (STORAGE_BAD) { STORAGE_BAD = false; toast("本地存储已恢复", 2400); }
+  } catch (e) {
+    console.warn(e);
+    if (!STORAGE_BAD) {
+      STORAGE_BAD = true;
+      toast("⚠️ 本地存储不可用（隐私模式或空间已满），本次修改未保存到本机", 4600);
+    }
+  }
+}
 function loadLocal() {
   try {
     const s = localStorage.getItem(LS_DATA);
@@ -190,7 +198,10 @@ function loadLocal() {
     if (y) SYNC = Object.assign(SYNC, JSON.parse(y));
   } catch (e) { console.warn(e); }
 }
-function saveSync() { try { localStorage.setItem(LS_SYNC, JSON.stringify(SYNC)); } catch (e) { } }
+function saveSync() {
+  try { localStorage.setItem(LS_SYNC, JSON.stringify(SYNC)); }
+  catch (e) { console.warn(e); /* 同步配置存不进去只影响下次免输入，不弹窗打扰 */ }
+}
 
 /* ============================================================
    数据迁移与去重
@@ -1070,6 +1081,8 @@ function calcShares() {
   }
 }
 function saveTrade() {
+  /* 防快速双击：第一次保存已 closeSheet，第二次点击进不来 */
+  if (!$("mask").classList.contains("show")) return;
   const p = DATA.products.find(x => x.id === UI.activePick);
   if (!p) return toast("请先选择产品");
   const type = $("tType").value;
@@ -1439,6 +1452,7 @@ function previewLink() {
 }
 
 function saveFromLink() {
+  if (!$("mask").classList.contains("show")) return;   /* 防快速双击重复添加 */
   /* 用预览时那份解析结果 —— 按钮上写多少只，就只加多少只 */
   const rows = UI.linkRows || parseProductLines($("lkInput") ? $("lkInput").value : "");
   const adds = rows.filter(x => x.status === "add");
@@ -1907,11 +1921,16 @@ function bulkNav(pid) {
       </tr>`).join("")}</tbody></table>
       ${st.rows.length > 60 ? `<div class="muted" style="font-size:11px;padding:6px 0">只显示前 60 行（共 ${st.rows.length} 行，写入时会全部处理）</div>` : ""}
     </div>
-    <button class="btn pri full" style="margin-top:9px" onclick="commitNav('${pid}')"${writable.length ? "" : " disabled"}>确认写入 ${writable.length} 条</button>`;
+    <button id="nCommit" class="btn pri full" style="margin-top:9px" onclick="commitNav('${pid}')"${writable.length ? "" : " disabled"}>确认写入 ${writable.length} 条</button>`;
 }
 
 /* 预览确认后真正落库。写入条数必须等于按钮上写的那个数字。 */
 function commitNav(pid) {
+  /* 防快速双击：点下即禁用按钮；openNav() 重渲染会重建按钮自然恢复。
+     （不要用时间窗守卫 —— 直接调用本函数连续写入多批净值是合法场景） */
+  const btn = $("nCommit");
+  if (btn && btn.disabled) return;
+  if (btn) btn.disabled = true;
   const p = DATA.products.find(x => x.id === pid); if (!p) return;
   const st = UI.navParsed || parseNavText(UI.navDraft || "", p.navHistory || {});
   const over = !!($("nBulkOver") && $("nBulkOver").checked);
@@ -2020,6 +2039,17 @@ function saveSyncCfg(test) {
   saveSync(); renderSet(); renderHome();
   if (test) testConn();
 }
+/* base64 ⇄ UTF-8（escape/unescape 已废弃，2026-09-15 审查替换） */
+function b64ToUtf8(b64) {
+  const bin = atob(String(b64).replace(/\n/g, ""));
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+}
+function utf8ToB64(s) {
+  const arr = new TextEncoder().encode(s);
+  let bin = "";
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin);
+}
 async function ghReq(method, url, body) {
   const r = await fetch(url, {
     method,
@@ -2028,7 +2058,8 @@ async function ghReq(method, url, body) {
       "Accept": "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28"
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20000),   /* 网络卡死时 20s 放弃，不再永久挂起 */
   });
   if (!r.ok) { const t = await r.text(); throw new Error(`HTTP ${r.status} ${t.slice(0, 120)}`); }
   return r.status === 204 ? null : r.json();
@@ -2049,7 +2080,7 @@ async function syncPull(manual) {
   try {
     const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
     SYNC.sha = info.sha; saveSync();
-    const remote = JSON.parse(decodeURIComponent(escape(atob(info.content.replace(/\n/g, "")))));
+    const remote = JSON.parse(b64ToUtf8(info.content));
     if (manual && !confirm("用云端数据覆盖本地？本地未同步的改动将丢失。\n建议：先在另一台设备推送，或先导出本地备份。")) return;
     /* 覆盖前留一份净值指纹，用来判断云端是不是真有新净值（见 notifyNewNav） */
     const before = navFingerprint();
@@ -2072,7 +2103,6 @@ async function syncPull(manual) {
 }
 async function syncPush(manual) {
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) { if (manual) toast("请先配置同步"); return; }
-  const payload = JSON.parse(JSON.stringify(DATA));
   const body = { message: `update ledger ${new Date().toISOString().slice(0, 16)}` };
   try {
     /* 推之前先读一次远端。两个原因，都跟「整文件替换」有关：
@@ -2081,26 +2111,33 @@ async function syncPush(manual) {
           刚写过），直接推就把云端刚写的抓取结果覆盖回旧值 —— 表现为「云端明明
           抓取失败了，App 的告警条却不出现」，而且不会有任何报错。
        ② 顺手拿到最新 sha，避免用陈旧 sha 提交导致 409 冲突。 */
+    let rs = {};
     try {
       const cur = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
       if (cur && cur.sha) {
         body.sha = cur.sha;
-        const rs = (JSON.parse(decodeURIComponent(escape(atob(String(cur.content).replace(/\n/g, ""))))) || {}).settings || {};
-        payload.settings = payload.settings || {};
-        for (const k of ["lastNavSync", "lastFetch"]) {
-          const a = rs[k], b = payload.settings[k];
-          /* 用 time 比较新旧；云端没有就保留本地，都没写就跳过 */
-          const ta = a ? String(a.time || a) : "";
-          const tb = b ? String(b.time || b) : "";
-          if (ta && ta > tb) payload.settings[k] = a;
-        }
+        rs = (JSON.parse(b64ToUtf8(cur.content)) || {}).settings || {};
       }
     } catch (e) { /* 读不到远端就按本地推，不阻断正常保存 */ }
     if (!body.sha) {
       try { const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`); body.sha = info.sha; } catch (e) { }
     }
-    body.content = btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 1))));
-    DATA.settings = payload.settings;      /* 把合并后的结果留在本地，下次不必再合 */
+    /* payload 在 PUT 前才生成：网络往返期间的用户编辑不会丢出本次推送 */
+    const payload = JSON.parse(JSON.stringify(DATA));
+    payload.settings = payload.settings || {};
+    for (const k of ["lastNavSync", "lastFetch"]) {
+      const a = rs[k], b = payload.settings[k];
+      /* 用 time 比较新旧；云端没有就保留本地，都没写就跳过 */
+      const ta = a ? String(a.time || a) : "";
+      const tb = b ? String(b.time || b) : "";
+      if (ta && ta > tb) payload.settings[k] = a;
+    }
+    body.content = utf8ToB64(JSON.stringify(payload, null, 1));
+    /* 只把合并后的两个抓取脚本字段留在本地，不整段覆盖 settings
+       （旧写法 DATA.settings = payload.settings 会用网络往返前的旧快照回写） */
+    DATA.settings = DATA.settings || {};
+    for (const k of ["lastNavSync", "lastFetch"])
+      if (payload.settings[k] !== undefined) DATA.settings[k] = payload.settings[k];
     const res = await ghReq("PUT", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`, body);
     SYNC.sha = res && res.content ? res.content.sha : ""; saveSync();
     $("syncState").textContent = "已同步";
