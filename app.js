@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v28";
+const APP_VER = "v29";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -57,13 +57,17 @@ const ORG_ALIAS = [
   /* 广银理财（cgbwmc.com.cn）：Rtp 框架 SPA，POST /wmpcext/noSessionServlet/{模块}/{动作}.fun
      整表翻页取最新净值（2026-09-16 接入）。产品代码形态极杂（1XFTLFB307A / LJR121 /
      HYGWCY0602A …）→ 不臆造正则，靠机构名判定。 */
-  ["广银理财", "guangyin"], ["广银", "guangyin"], ["cgbwmc", "guangyin"], ["guangyin", "guangyin"]
+  ["广银理财", "guangyin"], ["广银", "guangyin"], ["cgbwmc", "guangyin"], ["guangyin", "guangyin"],
+  /* 工银理财（wm.icbc.com.cn）：自研 KitRequest 加密通道（主/工作密钥 + HMAC-MD5 签名 +
+     AES-128-CBC 字段加密），走 clt/info/112901 列表 + 112902 明细取净值（2026-09-16 接入）。
+     产品代码形态多样（26GS6464 主码 / 26G6464A 销售码）→ 不臆造正则。 */
+  ["工银理财", "icbc"], ["工银", "icbc"], ["icbc", "icbc"]
 ];
 const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
                    nanyin: "南银理财", cmbc: "民生理财", wmbnb: "宁银理财",
                    huiyin: "徽银理财", bocwm: "中银理财", nongyin: "农银理财",
                    hangyin: "杭银理财", xingyin: "兴银理财", guangyin: "广银理财",
-                   chinawealth: "中国理财网" };
+                   icbc: "工银理财", chinawealth: "中国理财网" };
 function detectOrg(p) {
   if (!p) return "";
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
