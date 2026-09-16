@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v21";
+const APP_VER = "v22";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -1331,7 +1331,17 @@ function parseProductInput(raw) {
   let org = prodCode ? detectOrgByProdCode(prodCode).org : "";
   if (!org && code) org = "chinawealth";
   const okay = !!(code || prodCode);
-  return { code, prodCode, org, ok: okay, msg: okay ? "" : "没从这段内容里认出产品代码或登记编码" };
+  let msg = "";
+  if (!okay) {
+    msg = "没从这段内容里认出产品代码或登记编码。若是银行代销产品的代码（如中行 EW4455D 这类），"
+      + "请连同「登记编码」（Z 开头）一起贴上 —— 云端靠登记编码或产品名称查询，只有产品代码查不到";
+  } else if (prodCode && !code && !org) {
+    /* 银行代销链接的常见形态：能认出产品代码，但发行人不在已知名单里（2026-09-16 中行 EW4455D 实例）。
+       此时云端既无登记编码也无名称 → 会以「无法识别机构」跳过，必须提前提示。 */
+    msg = `已识别产品代码 ${prodCode}，但发行机构未识别：请补填「登记编码」（Z 开头，`
+      + "产品说明书或中国理财网可查），否则云端抓不到该产品净值";
+  }
+  return { code, prodCode, org, ok: okay, msg };
 }
 
 /* 产品显示名：链接添加的骨架产品名称是空的（留给云端回填），列表要有兜底 */
@@ -1389,7 +1399,9 @@ function parseProductLines(text) {
       status: dup ? "dup" : "add",
       key: r.prodCode || r.code,
       inst: ORG_NAME[r.org] || "",
-      note: dup ? `已存在「${prodLabel(dup)}」` : (ORG_NAME[r.org] || "识别不出机构，需手填机构名"),
+      note: dup ? `已存在「${prodLabel(dup)}」`
+        : (ORG_NAME[r.org] || (r.code ? "识别不出机构，需手填机构名"
+          : "机构未识别 + 无登记编码：请手填发行机构，并补登记编码（Z 开头），否则云端抓不到")),
     });
   });
   return rows;
@@ -1429,7 +1441,9 @@ function previewLink() {
     box.innerHTML = `<div class="note${dup ? "" : " g"}" style="margin-bottom:12px">
       ${parts.join(" · ")}<br>
       ${dup ? `⚠️ 已存在同代码产品「${esc(prodLabel(dup))}」，无需重复添加`
-        : "保存后同步到云端，下一次抓取自动补全产品名称与历史净值。"}
+        : (r.code ? "保存后同步到云端，下一次抓取自动补全产品名称与历史净值。"
+          : "⚠️ 还缺<b>登记编码</b>（Z 开头）：云端要靠它或产品名称去查询，"
+            + "请从产品说明书 / 中国理财网查到后填进「登记编码」栏（名称可留空，抓取后自动回填）。")}
     </div>`;
     setLinkSave(dup ? 0 : 1);
     return;
