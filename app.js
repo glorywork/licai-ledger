@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v20";
+const APP_VER = "v21";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -1991,8 +1991,10 @@ function refreshNav() {
     <div class="note b" style="margin-bottom:12px">
       净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 / 信银 / 南银 / 民生 官网均设置了跨域限制（CORS）或加密/风控，
       页面直连会被浏览器拦截 —— 这正是原「每日更新」按钮点了没反应的原因。<br><br>
-      现在由云端 <b>GitHub Actions</b> 每天 <b>08:00 / 12:00</b> 自动抓取官方公开披露的净值，
-      提交到你的私有仓库；本页点「从云端拉取」即可同步到手机 / 电脑。
+      现在由云端 <b>GitHub Actions</b> 每天 <b>00:00 / 06:00 / 08:00</b> 自动抓取官方公开披露的净值，
+      提交到你的私有仓库。<br>
+      ⚠️ GitHub 的免费定时任务是「尽力而为」，实测常延迟数小时甚至跳过 ——
+      <b>嫌慢就点下面的「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。
     </div>
     <div class="field"><label>云端最近一次抓取</label>
       <div class="note ${last ? "g" : ""}">${last ? esc(last) : "暂无记录（云端抓取任务尚未写入）"}</div>
@@ -2002,7 +2004,10 @@ function refreshNav() {
     </div>
     <div class="row-btn" style="margin-top:14px">
       <button class="btn gh" style="flex:1" onclick="closeSheet();go('pg-prod')">去产品页</button>
-      <button class="btn pri" style="flex:1" onclick="closeSheet();syncPull(true)">↓ 从云端拉取</button>
+      <button id="btnFetchNow" class="btn pri" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取</button>
+    </div>
+    <div class="row-btn" style="margin-top:8px">
+      <button class="btn" style="flex:1" onclick="closeSheet();syncPull(true)">↓ 从云端拉取</button>
     </div>`);
 }
 
@@ -2020,7 +2025,8 @@ function openSync() {
     <div class="field"><label>仓库名</label><input id="sRepo" value="${esc(SYNC.repo)}" placeholder="如 licai-data"></div>
     <div class="field"><label>数据文件路径</label><input id="sPath" value="${esc(SYNC.path)}" placeholder="licai-data.json"></div>
     <div class="field"><label>细粒度 Token</label><input id="sToken" type="password" value="${esc(SYNC.token)}" placeholder="github_pat_..."></div>
-    <div class="note">Token 只保存在本机浏览器，不会上传到任何第三方。若泄露可随时在 GitHub 吊销。</div>
+    <div class="note">Token 只保存在本机浏览器，不会上传到任何第三方。若泄露可随时在 GitHub 吊销。<br>
+      需要两项仓库权限：<code>Contents: Read and write</code>（读写数据）+ <code>Actions: Read and write</code>（用「⚡ 立即抓取」手动触发云端任务）。</div>
     <div class="row-btn" style="margin-top:14px">
       <button class="btn gh" style="flex:1" onclick="saveSyncCfg()">保存配置</button>
       <button class="btn pri" style="flex:1" onclick="saveSyncCfg(true)">保存并测试</button>
@@ -2028,6 +2034,9 @@ function openSync() {
     <div class="row-btn" style="margin-top:9px">
       <button class="btn gh" style="flex:1" onclick="syncPull(true)">↓ 拉取云端数据</button>
       <button class="btn pri" style="flex:1" onclick="syncPush(true)">↑ 推送本地数据</button>
+    </div>
+    <div class="row-btn" style="margin-top:9px">
+      <button id="btnFetchNow" class="btn" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取最新净值</button>
     </div>
     <div id="syncMsg" style="margin-top:10px"></div>`);
 }
@@ -2063,6 +2072,38 @@ async function ghReq(method, url, body) {
   });
   if (!r.ok) { const t = await r.text(); throw new Error(`HTTP ${r.status} ${t.slice(0, 120)}`); }
   return r.status === 204 ? null : r.json();
+}
+/* 手动触发云端抓取（#延时对策，2026-09-16）：
+   GitHub 免费仓库的 schedule 是「尽力而为」，实测延迟 2-9.5 小时且可能被跳过 ——
+   点这个按钮用 workflow_dispatch 立刻触发一次（官方接口，非定时任务、无排队延迟）。
+   需要令牌具备 Actions: Read and write（Contents 权限不够，403）。 */
+let _fetchPullTimer;
+async function triggerFetch() {
+  if (!SYNC.owner || !SYNC.repo || !SYNC.token) { toast("请先在「数据同步设置」里配置仓库与 Token"); return; }
+  const btn = $("btnFetchNow");
+  if (btn) { if (btn.disabled) return; btn.disabled = true; btn.textContent = "触发中…"; }
+  try {
+    await ghReq("POST",
+      `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/workflows/update_nav.yml/dispatches`,
+      { ref: "main" });
+    toast("已触发云端抓取，约 1-2 分钟后自动拉取最新净值", 4800);
+    /* 90 秒后自动拉一次（页面可见时），省得用户再来回点 */
+    clearTimeout(_fetchPullTimer);
+    _fetchPullTimer = setTimeout(() => {
+      if (document.visibilityState === "visible") syncPull(false);
+    }, 90000);
+  } catch (e) {
+    const s = String(e);
+    if (/403/.test(s)) {
+      toast("令牌缺少 Actions 权限：GitHub → 令牌设置 → Repository permissions 里 Actions 勾 Read and write（改权限不换令牌值）", 7000);
+    } else if (/404/.test(s)) {
+      toast("触发失败：仓库里没有 update_nav.yml，或 Token 无权访问该仓库", 5200);
+    } else {
+      toast("触发失败：" + s.slice(0, 90), 4200);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "⚡ 立即抓取"; }
+  }
 }
 function syncMsg(html) { const e = $("syncMsg"); if (e) e.innerHTML = html; else toast(html.replace(/<[^>]+>/g, "")); }
 async function testConn() {
