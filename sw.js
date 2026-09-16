@@ -2,7 +2,7 @@
    外壳缓存优先；数据由 GitHub 同步，不走缓存
    注意：改 app.js / index.html 后必须把下面的 CACHE 版本号 +1，
         并与 app.js 里的 APP_VER 保持一致（_test_dom.js 有断言守住）。 */
-const CACHE = "licai-ledger-v28";
+const CACHE = "licai-ledger-v29";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
