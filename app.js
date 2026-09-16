@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v19";
+const APP_VER = "v20";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -459,15 +459,21 @@ function portfolio() {
   return { rows, pendingRows, closedRows, totalAsset, totalCost, totalPending, totalRealized };
 }
 
-/* 两个日期区间内整体收益（按各产品净值变动 × 区间末的已确认份额） */
+/* 区间收益（#19 口径，2026-09-15）：逐披露日加权 ——
+   每个披露日用「截至当日已确认份额」× 当日净值差，与日历 dayProfit 完全同口径。
+   旧实现用「区间末份额 × 整段净值差」：月中买入会把建仓前涨幅算给它（虚高）、
+   月中卖出漏计已卖份额段（虚低），且与日历逐日加总不一致。
+   区间边界：算 (fromDate, toDate] 内的披露日（fromDate 当日净值作基准不计入）。 */
 function periodProfit(fromDate, toDate) {
   let s = 0;
   for (const p of DATA.products) {
-    const sh = sharesOn(p, toDate);
-    if (sh <= 0) continue;
-    const a = navOnOrBefore(p, fromDate), b = navOnOrBefore(p, toDate);
-    if (!a || !b) continue;
-    s += sh * (Number(b[1]) - Number(a[1]));
+    const s0 = navSeries(p);
+    for (let i = 1; i < s0.length; i++) {
+      const d = s0[i][0];
+      if (d <= fromDate || d > toDate) continue;
+      const sh = sharesOn(p, d);
+      if (sh > 0) s += sh * (Number(s0[i][1]) - Number(s0[i - 1][1]));
+    }
   }
   return s;
 }
@@ -487,27 +493,21 @@ function dayProfit(date) {
   }
   return s;
 }
-/* 某自然月收益
-   基准取法：优先取「月初或之前最近净值」；若月初尚无净值（如产品月中才成立/才开始记录），
-   退而取「该月内第一条净值」作基准，避免首月恒为 0。 */
+/* 某自然月收益（#19 口径，2026-09-15）：该月每个披露日的日收益加总
+   （当日已确认份额 × 净值差），与日历逐日加总完全一致。
+   产品序列首条披露日无前值，不产生收益（与 dayProfit 同规则）。 */
 function monthProfit(y, m) {
   const first = `${y}-${pad(m)}-01`;
-  const lastD = new Date(y, m, 0).getDate();
-  const last = `${y}-${pad(m)}-${pad(lastD)}`;
+  const last = `${y}-${pad(m)}-${pad(new Date(y, m, 0).getDate())}`;
   let s = 0;
   for (const p of DATA.products) {
-    const sh = sharesOn(p, last);
-    if (sh <= 0) continue;
-    let a = navOnOrBefore(p, first);
-    const b = navOnOrBefore(p, last);
-    if (!b) continue;
-    if (!a) {
-      /* 月初无净值：取该月内第一条净值作为基准 */
-      const s0 = navSeries(p);
-      a = s0.find(x => x[0] >= first && x[0] <= last) || null;
-      if (!a || a[0] === b[0]) continue; /* 该月只有一条净值，无变动 */
+    const s0 = navSeries(p);
+    for (let i = 0; i < s0.length; i++) {
+      const d = s0[i][0];
+      if (d < first || d > last || i === 0) continue;
+      const sh = sharesOn(p, d);
+      if (sh > 0) s += sh * (Number(s0[i][1]) - Number(s0[i - 1][1]));
     }
-    s += sh * (Number(b[1]) - Number(a[1]));
   }
   return s;
 }
