@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v23";
+const APP_VER = "v24";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -40,11 +40,15 @@ const ORG_ALIAS = [
   ["宁银理财", "wmbnb"], ["宁银", "wmbnb"], ["wmbnb", "wmbnb"],
   /* 徽银（徽商银行理财）：官网 lccs.php 列表 + lccs_income_list.php 历史表直抓
      （2026-09-16 接入），与云端 ORG_ALIAS 末尾四项同序同构。 */
-  ["徽银理财", "huiyin"], ["徽银", "huiyin"], ["hsbank", "huiyin"], ["huiyin", "huiyin"]
+  ["徽银理财", "huiyin"], ["徽银", "huiyin"], ["hsbank", "huiyin"], ["huiyin", "huiyin"],
+  /* 中银理财（bocwm.cn）：官网 webApi getNetWorthByCode 直抓全历史（2026-09-16 接入），
+     与云端 ORG_ALIAS 末尾三项同序同构。
+     注意「中银理财」≠「中国银行」—— 中行只是代销渠道，发行方是中银理财。 */
+  ["中银理财", "bocwm"], ["中银", "bocwm"], ["bocwm", "bocwm"]
 ];
 const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
                    nanyin: "南银理财", cmbc: "民生理财", wmbnb: "宁银理财",
-                   huiyin: "徽银理财", chinawealth: "中国理财网" };
+                   huiyin: "徽银理财", bocwm: "中银理财", chinawealth: "中国理财网" };
 function detectOrg(p) {
   if (!p) return "";
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
