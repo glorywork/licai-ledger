@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v29";
+const APP_VER = "v30";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -131,21 +131,64 @@ function prodCodeOf(p) {
 function fetchStatus(p) {
   const code = String(p && p.prodCode || "").trim();
   const org = detectOrg(p);
-  if (org === "chinawealth") {
-    const reg = String(p && p.regCode || p && p.code || "").trim().toUpperCase();
-    const hasName = !!(p && p.name && String(p.name).trim());
-    /* 云端 fetch_chinawealth 支持「登记编码 或 产品名称」两种查询键，
-       名称含发行方全称（如广银理财…）时按名称搜索即可，不必强制 Z 编码。 */
-    const hasReg = /^Z\d{12,14}$/.test(reg);
-    if (!hasReg && !hasName) {
-      return { ok: false, lv: "warn", txt: "⚠️ 中国理财网查询需填登记编码（Z 开头）或完整产品名称" };
-    }
-    const via = hasReg ? "按登记编码" : "按产品名称";
-    return { ok: true, lv: "ok", txt: `✓ 云端可自动抓最新净值（中国理财网·${via}）` };
+  const reg = String((p && (p.regCode || p.code)) || "").trim().toUpperCase();
+  const hasReg = /^Z\d{12,14}$/.test(reg);
+  const nm = String((p && p.name) || "").trim();
+  /* 按产品名称搜索只在名称足够完整时才有意义（"某产品"这类短名在信披平台搜不到），
+     故要求 6 字以上 —— 与云端「按名搜索」的实际可用性对齐。 */
+  const hasName = nm.length >= 6;
+  /* 中国理财网信披平台：登记编码（精确）或完整产品名称（模糊）任一即可查，覆盖任意发行方 */
+  const cwVia = hasReg ? "按登记编码" : (hasName ? "按产品名称" : "");
+  /* 发行方官网抓取器：只认「产品代码」 */
+  const official = org && org !== "chinawealth" && ORG_NAME[org];
+
+  if (official && code) {
+    /* 两条线都能跑 —— 云端会同时抓、自动择优（更新的胜，同日以官网为准） */
+    return { ok: true, lv: "ok", txt: `✓ 双线自动抓取（${ORG_NAME[org]}官网 + 中国理财网）` };
   }
-  if (!code) return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
+  if (official && !code) {
+    return cwVia
+      ? { ok: true, lv: "ok", txt: `✓ 中国理财网可抓（${cwVia}）—— 补填「产品代码」还能叠加 ${ORG_NAME[org]} 官网（历史更全）` }
+      : { ok: false, lv: "warn", txt: `⚠️ 缺产品代码：${ORG_NAME[org]} 官网按产品代码查询；也可填登记编码（Z 开头）走中国理财网` };
+  }
+  if (cwVia) {
+    return { ok: true, lv: "ok", txt: `✓ 中国理财网可自动抓最新净值（${cwVia}）` };
+  }
+  if (org === "chinawealth") {
+    return { ok: false, lv: "warn", txt: "⚠️ 中国理财网查询需填登记编码（Z 开头）或完整产品名称" };
+  }
   if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（机构栏填理财公司全名如「招银理财/工银理财」，或填 Z 开头登记编码走中国理财网）" };
-  return { ok: true, lv: "ok", txt: `✓ 云端可自动抓净值（${ORG_NAME[org]}）` };
+  return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
+}
+
+/* 本轮抓取「这条净值是从哪条线来的」——云端每次抓取都会对同一产品同时查
+   【官网抓取器】与【中国理财网聚合源】，自动择优，结果写在
+   settings.lastFetch.products[产品id]。这里读出来给用户看（来源 / 最新日期 /
+   为什么选它 / 两源是否一致）。没有记录（如从未抓过）时返回 null。 */
+function navSrcInfo(p) {
+  const lf = lastFetchInfo();
+  const all = (lf && lf.products) || {};
+  let info = all[String((p && p.id) || "")];
+  if (!info) {
+    /* 兜底：产品 id 迁移过时，用登记编码 / 产品代码再找一次 */
+    const keys = [p && p.code, p && p.prodCode, p && p.regCode]
+      .map(x => String(x || "").trim().toUpperCase()).filter(Boolean);
+    for (const k of Object.keys(all)) {
+      if (keys.includes(String(k).toUpperCase())) { info = all[k]; break; }
+    }
+  }
+  return info && info.latest ? info : null;
+}
+/* 来源摘要的一行文字（含择优理由），供详情页 / 说明页复用 */
+function navSrcText(info) {
+  if (!info) return "";
+  const n = (info.sources || []).length;
+  const base = `${info.via}·${info.label} ${info.latest}`;
+  const why = info.why ? `（${info.why}）` : "";
+  const both = n > 1 ? "｜双线已比对" : "｜另一条线本次未取到";
+  const cf = info.conflicts && info.conflicts.length
+    ? `｜⚠️ 与另一源有 ${info.conflicts.length} 处同日数值差异` : "";
+  return base + why + both + cf;
 }
 
 /* ---------- 数据 ---------- */
@@ -1700,6 +1743,7 @@ function renderProdDetail() {
   const latestDate = n ? st.dates[n - 1] : "";
   const wan = lastNum(st.wan), a7 = lastNum(st.a7), a14 = lastNum(st.a14), a30 = lastNum(st.a30);
   const since = sinceAnnual(st);
+  const src = navSrcInfo(p);                 /* 上次抓取的双源比对结果（官网 vs 中国理财网） */
   const navFmt = v => (v === null ? "—" : Number(v).toFixed(4));
   const pctFmt = v => (v === null ? "—" : `${v >= 0 ? "+" : ""}${pct(v)}`);
 
@@ -1732,6 +1776,16 @@ function renderProdDetail() {
         ${p.estDate ? `<i>成立日 <b>${esc(p.estDate)}</b></i>` : ""}
       </div>
     </div>
+    ${src ? `<div class="tip" style="margin-top:8px">
+      🔀 最新净值取自 <b>${esc(src.via)}·${esc(src.label)}</b>（${esc(src.latest)}）${esc(src.why ? "—— " + src.why : "")}
+      ${(src.sources || []).length > 1
+        ? `｜两条线已比对：${(src.sources || []).map(s => esc(`${s.label} ${s.latest || "—"}`)).join(" vs ")}`
+        : "｜另一条线本次未取到，已用单源"}
+      ${src.conflicts && src.conflicts.length
+        ? `<br>⚠️ 与另一条线有 <b>${src.conflicts.length}</b> 处同日数值差异（已按上述来源取值），`
+          + `如 ${esc(src.conflicts[0].d)}：采用 ${esc(String(src.conflicts[0].used))}`
+        : ""}
+    </div>` : ""}
 
     <div class="grid2" style="margin-top:12px">
       <div class="stat"><div class="l">最新净值${latestDate ? "（" + esc(latestDate.slice(5)) + "）" : ""}</div><div class="v" style="color:var(--brand)">${navFmt(latest)}</div><div class="cap">官方披露的份额净值</div></div>
@@ -2024,8 +2078,10 @@ function refreshNav() {
   const hf = lastFetchInfo(), hfN = fetchFailCount(hf);
   const rows = DATA.products.map(p => {
     const st = fetchStatus(p);
+    const srcTxt = navSrcText(navSrcInfo(p));
     return `<div class="sumline" style="align-items:flex-start">
-      <span class="k" style="flex:1">${esc(prodLabel(p))}</span>
+      <span class="k" style="flex:1">${esc(prodLabel(p))}${srcTxt
+        ? `<div class="tip" style="margin-top:2px">上次抓取来源：${esc(srcTxt)}</div>` : ""}</span>
       <b class="${st.ok ? "down" : "muted"}" style="font-size:10.5px;text-align:right;margin-left:8px">${esc(st.txt)}</b>
     </div>`;
   }).join("") || `<div class="empty">暂无产品</div>`;
@@ -2035,7 +2091,11 @@ function refreshNav() {
       净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 / 信银 / 南银 / 民生 官网均设置了跨域限制（CORS）或加密/风控，
       页面直连会被浏览器拦截 —— 这正是原「每日更新」按钮点了没反应的原因。<br><br>
       现在由云端 <b>GitHub Actions</b> 每天 <b>00:00 / 06:00 / 08:00</b> 自动抓取官方公开披露的净值，
-      提交到你的私有仓库。<br>
+      提交到你的私有仓库。<br><br>
+      <b>每条净值都会同时查两条线</b>：<b>① 发行方官网</b>（历史全、多为原始披露）与
+      <b>② 中国理财网信披平台</b>（覆盖任意发行方，部分产品反而更新更快）。云端自动比对后
+      <b>采用更新的那条</b>；同一天两条线都有时用<b>官网</b>（原始披露方，避免转抄差），
+      另一条线独有的历史日期会一并保留。<br><br>
       ⚠️ GitHub 的免费定时任务是「尽力而为」，实测常延迟数小时甚至跳过 ——
       <b>嫌慢就点下面的「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。
     </div>
