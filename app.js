@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v22";
+const APP_VER = "v23";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -37,11 +37,14 @@ const ORG_ALIAS = [
   ["民生理财", "cmbc"], ["民生", "cmbc"], ["cmbc", "cmbc"],
   /* 宁银（宁波银行理财）：官网净值表可服务端直抓（2026-09-13 接入），
      与云端 ORG_ALIAS 末尾三项同序同构。注意「宁银」≠「南银」。 */
-  ["宁银理财", "wmbnb"], ["宁银", "wmbnb"], ["wmbnb", "wmbnb"]
+  ["宁银理财", "wmbnb"], ["宁银", "wmbnb"], ["wmbnb", "wmbnb"],
+  /* 徽银（徽商银行理财）：官网 lccs.php 列表 + lccs_income_list.php 历史表直抓
+     （2026-09-16 接入），与云端 ORG_ALIAS 末尾四项同序同构。 */
+  ["徽银理财", "huiyin"], ["徽银", "huiyin"], ["hsbank", "huiyin"], ["huiyin", "huiyin"]
 ];
 const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
                    nanyin: "南银理财", cmbc: "民生理财", wmbnb: "宁银理财",
-                   chinawealth: "中国理财网" };
+                   huiyin: "徽银理财", chinawealth: "中国理财网" };
 function detectOrg(p) {
   if (!p) return "";
   const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
@@ -79,7 +82,10 @@ const PRODCODE_RULES = [
      实测全集前缀 FBAG/FBAE/FBAF/FSAE/FSAF/FSAG/FGAE/FGAG/FGAF；登记编码查询 0 命中。 */
   [/^F[A-Z]{3}\d{5}[A-Z]$/i, "cmbc", "民生产品代码：F + 3 位字母 + 5 位数字 + 份额字母（如 FBAG65601C）"],
   /* 宁银：Z + 2 位字母 + 7 位数字 + 份额字母，如 ZGN2360006C。官网净值表按此份额代码查询。 */
-  [/^Z[A-Z]{2}\d{7}[A-Z]$/i, "wmbnb", "宁银产品代码：Z + 2 位字母 + 7 位数字 + 份额字母（如 ZGN2360006C）"]
+  [/^Z[A-Z]{2}\d{7}[A-Z]$/i, "wmbnb", "宁银产品代码：Z + 2 位字母 + 7 位数字 + 份额字母（如 ZGN2360006C）"],
+  /* 徽银：PNHY + 6 位数字 +（可带下划线）+ 份额字母，如 PNHY260367F / PNHY240108_B。
+     官网 lccs.php 列表按此代码定位产品；比对时云端会忽略下划线。 */
+  [/^PNHY\d{6}_?[A-Z]$/i, "huiyin", "徽银产品代码：PNHY + 6 位数字 +（可带 _）+ 份额字母（如 PNHY260367F）"]
 ];
 function detectOrgByProdCode(code) {
   const s = String(code == null ? "" : code).trim();
