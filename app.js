@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v31";
+const APP_VER = "v32";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -247,10 +247,17 @@ function toast(msg, ms = 2000) {
 function dayDiff(a, b) { return Math.round((parseDate(b) - parseDate(a)) / 86400000); }
 /* ---------- 持久化 ---------- */
 /* （workdaysBetween 已删除：定义后从未被调用，且容易让人误以为 T+1 用工作日口径 —— 2026-09-15 审查清理） */
-
-/* ---------- 持久化 ---------- */
 let STORAGE_BAD = false;   /* 只提示一次，成功后自动复位 */
+/* 数据版本号：每次 saveLocal（即任何对 DATA 的持久化改动）+1，
+   position() 的结果缓存据此失效（v32 P1-3）。 */
+let _POS_VER = 0;
+/* 本地有改动尚未成功推送到云端时为 true（v32 P0-2）：
+   静默拉取（启动 / 回前台 / online / 后台轮询）看到 dirty 会先推后拉，
+   避免云端旧数据把本地还没推上去的编辑覆盖丢掉。 */
+let DIRTY = false;
+function dirtyPersist() { try { localStorage.setItem(LS_DATA + ".dirty", DIRTY ? "1" : "0"); } catch (e) { } }
 function saveLocal() {
+  _POS_VER++; DIRTY = true; dirtyPersist();
   try {
     localStorage.setItem(LS_DATA, JSON.stringify(DATA));
     if (STORAGE_BAD) { STORAGE_BAD = false; toast("本地存储已恢复", 2400); }
@@ -268,6 +275,7 @@ function loadLocal() {
     if (s) { const o = JSON.parse(s); DATA = Object.assign({ products: [], trades: [], settings: {} }, o); }
     const y = localStorage.getItem(LS_SYNC);
     if (y) SYNC = Object.assign(SYNC, JSON.parse(y));
+    DIRTY = localStorage.getItem(LS_DATA + ".dirty") === "1";   /* v32 P0-2 */
   } catch (e) { console.warn(e); }
 }
 function saveSync() {
@@ -316,6 +324,8 @@ function isSameProduct(a, b) {
   if (ca && cb && ca.toUpperCase() === cb.toUpperCase()) return true;
   const pa = String(a.prodCode || "").trim(), pb = String(b.prodCode || "").trim();
   if (pa && pb && pa.toUpperCase() === pb.toUpperCase()) return true;
+  /* 产品代码都填了但不一致：不同份额/不同产品，同样禁止名称误合并（v32 P1-5） */
+  if (pa && pb && pa.toUpperCase() !== pb.toUpperCase()) return false;
   const na = String(a.name || "").trim(), nb = String(b.name || "").trim();
   if (!na || !nb) return false;
   const s = na.length <= nb.length ? na : nb;
@@ -469,8 +479,14 @@ function tradeShares(t, p) {
 /* 某产品当前持仓：份额、成本（成本法：加权平均）
    确认口径：只有确认日 <= 今天的买入才计入 shares/cost；
    确认日 > 今天的买入进 pendingShares/pendingAmount（在途），不计息、不显示市值。 */
+/* position 结果缓存（v32 P1-3）：渲染热路径每轮反复调 position/portfolio，
+   全量重算 O(产品×交易)。以「数据版本号 + 当天日期」为键 ——
+   任何 saveLocal 都会 bump _POS_VER；跨天由 day 比对自动失效。 */
+const _posCache = new Map();
 function position(p) {
   const td = today();
+  const _ck = _posCache.get(p.id);
+  if (_ck && _ck.ver === _POS_VER && _ck.day === td) return _ck.pos;
   const ts = DATA.trades.filter(t => t.prodId === p.id)
     .sort((a, b) => (a.confirmDate || a.tradeDate || "").localeCompare(b.confirmDate || b.tradeDate || ""));
   let shares = 0, cost = 0, realized = 0;
@@ -511,8 +527,10 @@ function position(p) {
      横截面上会误导用户。低于 7 天不给年化，改由页面展示"持有不足"提示。 */
   const annualValid = holdDays >= 7;
   if (!annualValid) holdAnnual = 0;
-  return { shares, cost, market, profit, realized, lastNav, lastDate, startDate, holdDays, holdAnnual, annualValid,
+  const pos = { shares, cost, market, profit, realized, lastNav, lastDate, startDate, holdDays, holdAnnual, annualValid,
            pendingShares, pendingAmount, hasPending, inTransit, navSeries: navSeries(p) };
+  _posCache.set(p.id, { ver: _POS_VER, day: td, pos: pos });
+  return pos;
 }
 
 /* 全仓汇总（三态）
@@ -2318,10 +2336,20 @@ async function triggerFetch() {
   if (btn) { if (btn.disabled) return; btn.disabled = true; btn.textContent = "触发中…"; }
   MANUAL = { state: "running", t0: Date.now(), runNo: "", runApiId: 0, dur: 0 };
   saveManual(); renderManBox();
+  const dispatch = () => ghReq("POST",
+    `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/workflows/update_nav.yml/dispatches`,
+    { ref: SYNC.branch || "main" });
   try {
-    await ghReq("POST",
-      `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/workflows/update_nav.yml/dispatches`,
-      { ref: "main" });
+    try {
+      await dispatch();
+    } catch (e) {
+      /* v32 P1-4：ref 不写死 main —— 仓库默认分支不是 main 时 dispatch 会 404，
+         此时探一次 default_branch 缓存下来并重试（平时零额外请求）。 */
+      if (!/404/.test(String(e))) throw e;
+      const repo = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}`);
+      SYNC.branch = (repo && repo.default_branch) || "main"; saveSync();
+      await dispatch();
+    }
     toast("已触发云端抓取，结果会自动出现在弹层里（约 1-4 分钟）", 4800);
     _manPolling = false; ensureManualPolling();      /* 触发成功即开始追踪运行结果 */
   } catch (e) {
@@ -2348,6 +2376,7 @@ async function testConn() {
   syncMsg("测试连接中…");
   try {
     const repo = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}`);
+    if (repo && repo.default_branch) { SYNC.branch = repo.default_branch; saveSync(); }   /* v32 P1-4：缓存默认分支 */
     let exists = false;
     try { await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`); exists = true; } catch (e) { }
     syncMsg(`<div class="note g">连接成功：<b>${esc(repo.full_name)}</b>（${repo.private ? "私有" : "⚠️ 公开！"}）<br>数据文件${exists ? "已存在" : "尚不存在，首次推送会自动创建"}</div>`);
@@ -2355,6 +2384,13 @@ async function testConn() {
 }
 async function syncPull(manual) {
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) { if (manual) toast("请先配置同步"); return; }
+  /* v32 P0-2：本地还有没推上去的改动时，静默拉取一律先推后拉（拉回自己的改动+云端独有净值）；
+     推送失败就放弃本次拉取 —— 绝不能用云端旧数据覆盖本地新编辑。
+     手动拉取本身有「本地未同步的改动将丢失」确认弹窗，直接放行。 */
+  if (!manual && DIRTY) {
+    await syncPush(false);
+    if (DIRTY) return;
+  }
   try {
     const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
     SYNC.sha = info.sha; saveSync();
@@ -2364,11 +2400,13 @@ async function syncPull(manual) {
     const before = navFingerprint();
     DATA = Object.assign({ products: [], trades: [], settings: {} }, remote);
     saveLocal();
+    const pullVer = _POS_VER;
     /* 云端数据同样要过一遍迁移：合并重复产品、搬迁销售代码。
        若发生变更则回写云端 —— 抓取脚本读到正确的产品代码后才会抓到净值。 */
     const migratedRemote = migrateData();
     renderHome(); renderTrade(); renderProd(); renderSet();
     if (migratedRemote) { notifyMigrate(); autoPush(); }
+    else if (_POS_VER === pullVer) { DIRTY = false; dirtyPersist(); }   /* 拉下来的就是云端现势，本地没有未推送改动 */
     const after = navFingerprint();
     /* before.count 为 0 说明本机还没有任何净值（首次拉取 / 换设备），
        拿它当基准会算出「云端有 200 条新净值」这种荒唐提示，故跳过。 */
@@ -2389,12 +2427,14 @@ async function syncPush(manual) {
           刚写过），直接推就把云端刚写的抓取结果覆盖回旧值 —— 表现为「云端明明
           抓取失败了，App 的告警条却不出现」，而且不会有任何报错。
        ② 顺手拿到最新 sha，避免用陈旧 sha 提交导致 409 冲突。 */
-    let rs = {};
+    let rs = {}, rpArr = null;
     try {
       const cur = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
       if (cur && cur.sha) {
         body.sha = cur.sha;
-        rs = (JSON.parse(b64ToUtf8(cur.content)) || {}).settings || {};
+        const robj = JSON.parse(b64ToUtf8(cur.content)) || {};
+        rs = robj.settings || {};
+        rpArr = Array.isArray(robj.products) ? robj.products : null;
       }
     } catch (e) { /* 读不到远端就按本地推，不阻断正常保存 */ }
     if (!body.sha) {
@@ -2402,6 +2442,7 @@ async function syncPush(manual) {
     }
     /* payload 在 PUT 前才生成：网络往返期间的用户编辑不会丢出本次推送 */
     const payload = JSON.parse(JSON.stringify(DATA));
+    const _pushVer = _POS_VER;   /* payload 快照对应的数据版本（推送成功后据此决定是否清 dirty） */
     payload.settings = payload.settings || {};
     for (const k of ["lastNavSync", "lastFetch"]) {
       const a = rs[k], b = payload.settings[k];
@@ -2409,6 +2450,21 @@ async function syncPush(manual) {
       const ta = a ? String(a.time || a) : "";
       const tb = b ? String(b.time || b) : "";
       if (ta && ta > tb) payload.settings[k] = a;
+    }
+    /* v32 P0-1：云端独有净值并入 payload。
+       PUT 是整文件替换，payload 里的 navHistory 是打开页面时的旧快照 ——
+       不合并的话，App 开着期间云端 Actions 刚抓到的新净值会被这次推送抹掉。
+       只并入「本地没有的日期」；同日冲突保留本地值（用户显式补录优先）。
+       按 id 匹配；云端有而本地没有的产品不回填 —— 那可能是本机刚删除的，回填会复活。 */
+    if (rpArr) {
+      const byId = new Map((payload.products || []).map(x => [String(x.id), x]));
+      for (const rp of rpArr) {
+        const lp = byId.get(String(rp.id));
+        if (!lp || !rp.navHistory) continue;
+        const lh = lp.navHistory || (lp.navHistory = {});
+        for (const d in rp.navHistory)
+          if (lh[d] === undefined || lh[d] === null || lh[d] === "") lh[d] = rp.navHistory[d];
+      }
     }
     body.content = utf8ToB64(JSON.stringify(payload, null, 1));
     /* 只把合并后的两个抓取脚本字段留在本地，不整段覆盖 settings
@@ -2418,6 +2474,9 @@ async function syncPush(manual) {
       if (payload.settings[k] !== undefined) DATA.settings[k] = payload.settings[k];
     const res = await ghReq("PUT", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`, body);
     SYNC.sha = res && res.content ? res.content.sha : ""; saveSync();
+    /* 推送成功：payload 生成后没有新的本地改动才清 dirty（有的话说明网络期间又编辑了，
+       新一轮 autoPush 会接着推） */
+    if (_pushVer === _POS_VER) { DIRTY = false; dirtyPersist(); }
     $("syncState").textContent = "已同步";
     if (manual) toast("已推送到云端");
   } catch (e) {
@@ -2612,9 +2671,12 @@ async function checkCloudUpdate() {
 function exportJSON() {
   const blob = new Blob([JSON.stringify(DATA, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
+  const url = URL.createObjectURL(blob);
+  a.href = url;
   a.download = `理财台账备份_${today()}.json`;
-  a.click(); toast("已导出备份");
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);   /* v32 P2：下载启动后再回收，防内存滞留 */
+  toast("已导出备份");
 }
 function importJSON() {
   const inp = document.createElement("input"); inp.type = "file"; inp.accept = ".json";
