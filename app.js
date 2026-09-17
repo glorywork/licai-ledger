@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v30";
+const APP_VER = "v31";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -2100,7 +2100,10 @@ function refreshNav() {
       <b>嫌慢就点下面的「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。
     </div>
     <div class="field"><label>云端最近一次抓取</label>
-      <div class="note ${last ? "g" : ""}">${last ? esc(last) : "暂无记录（云端抓取任务尚未写入）"}</div>
+      <div id="navSyncTime" class="note ${last ? "g" : ""}">${last ? esc(last) : "暂无记录（云端抓取任务尚未写入）"}</div>
+    </div>
+    <div class="field"><label>手动抓取（⚡ 立即抓取）结果</label>
+      <div id="manFetchBox">${manStatusHtml()}</div>
     </div>
     <div class="field"><label>各产品抓取就绪状态（${ready} / ${DATA.products.length} 可自动抓取）</label>
       <div>${rows}<div class="tip" style="margin-top:6px">判定口径与云端抓取脚本一致：<b>机构可识别</b> + <b>已填产品代码</b>。标 ⚠️ 的产品请到「产品」页点「编辑」补填。</div></div>
@@ -2112,6 +2115,7 @@ function refreshNav() {
     <div class="row-btn" style="margin-top:8px">
       <button class="btn" style="flex:1" onclick="closeSheet();syncPull(true)">↓ 从云端拉取</button>
     </div>`);
+  ensureManualPolling();   /* 上次手动抓取还在跑就接着追踪 */
 }
 
 /* ============================================================
@@ -2141,7 +2145,11 @@ function openSync() {
     <div class="row-btn" style="margin-top:9px">
       <button id="btnFetchNow" class="btn" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取最新净值</button>
     </div>
+    <div class="field" style="margin-top:10px"><label>手动抓取结果</label>
+      <div id="manFetchBox">${manStatusHtml()}</div>
+    </div>
     <div id="syncMsg" style="margin-top:10px"></div>`);
+  ensureManualPolling();
 }
 function saveSyncCfg(test) {
   SYNC.owner = ($("sOwner").value || "").trim();
@@ -2180,30 +2188,156 @@ async function ghReq(method, url, body) {
    GitHub 免费仓库的 schedule 是「尽力而为」，实测延迟 2-9.5 小时且可能被跳过 ——
    点这个按钮用 workflow_dispatch 立刻触发一次（官方接口，非定时任务、无排队延迟）。
    需要令牌具备 Actions: Read and write（Contents 权限不够，403）。 */
-let _fetchPullTimer;
+/* ---------- 手动抓取结果跟踪（v31） ----------
+   workflow_dispatch 成功只返回 204、**不带 run id**，所以「到底成没成」必须触发后
+   主动去查最近一次 workflow_dispatch 运行。状态写进 localStorage：弹层关掉重开、
+   或 PWA 被系统回收再打开，都还能看到上次结果（12 分钟上限自动收口，不会一直转圈）。 */
+const LS_MANUAL = "licai.manualFetch";
+let MANUAL = loadManual();
+let _manPollTimer = null, _manPolling = false;
+function loadManual() { try { return JSON.parse(localStorage.getItem(LS_MANUAL)) || {}; } catch (e) { return {}; } }
+function saveManual() { try { localStorage.setItem(LS_MANUAL, JSON.stringify(MANUAL)); } catch (e) { } }
+function stampOf(ms) {
+  const d = new Date(ms || Date.now());
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function durTxt(ms) {
+  ms = Math.max(0, Number(ms) || 0);
+  return ms >= 60000 ? `${Math.floor(ms / 60000)} 分 ${Math.round((ms % 60000) / 1000)} 秒` : `${Math.round(ms / 1000)} 秒`;
+}
+/* 状态条：一眼回答「手动抓取到底成没成、数据到没到」。
+   workflow_dispatch 是异步的 —— 用户点完只看得到一个 toast，所以这里把
+   触发时间 / 运行号 / 耗时 / 云端回报的抓取时间 / 新增条数都摊开写清楚。 */
+function manStatusHtml() {
+  const m = MANUAL || {};
+  if (!m.t0) return `<div class="note">还没有手动抓取记录。点下面的「⚡ 立即抓取」可立刻触发一次云端抓取，不受定时排队影响。</div>`;
+  const at = stampOf(m.t0);
+  const run = m.runNo ? ` ｜ 运行 <b>#${esc(m.runNo)}</b>` : "";
+  const clear = `<div style="margin-top:6px"><span class="more" onclick="resetManualFetch()">清除这条记录 ›</span></div>`;
+  if (m.state === "running")
+    return `<div class="note b"><b>⏳ 手动抓取进行中…</b>
+      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run}${m.dur ? " ｜ 已等 " + durTxt(m.dur) : ""}<br>
+      ${m.runNo ? "云端正在抓取，通常 1-4 分钟。" : "已提交，等待云端接单…"}本页可继续使用，出结果后这里会自动更新。</div></div>`;
+  if (m.state === "ok") {
+    const extra = m.navTime
+      ? `<br>云端回报的抓取时间 <b>${esc(m.navTime)}</b>` + (m.added ? ` ｜ 本次新增净值 <b>${m.added}</b> 条` : " ｜ 暂无新增（披露源还没更新）")
+      : "";
+    const warn = m.fail ? `<br>⚠️ 但仍有 <b>${m.fail}</b> 只产品没拿到净值（见下方状态）` : "";
+    return `<div class="note g"><b>✅ 手动抓取成功</b>
+      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${extra}${warn}</div>${clear}</div>`;
+  }
+  if (m.state === "fail")
+    return `<div class="note"><b>❌ 手动抓取失败</b>（云端结论：${esc(m.conclusion || "failure")}）
+      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b><br>
+      到 GitHub 仓库的 Actions 页可看运行日志；整轮失败会自动建 Issue。</div>${clear}</div>`;
+  if (m.state === "timeout")
+    return `<div class="note"><b>⚠️ 手动抓取未在预期时间内完成</b>
+      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run}<br>
+      已等超过 12 分钟仍未拿到结论（GitHub 免费账号偶发排队）。可点「↓ 从云端拉取」直接看数据到没到。</div>${clear}</div>`;
+  return `<div class="note"><b>⚠️ 手动抓取未能确认结果</b>
+    <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run}<br>${esc(m.msg || "")}<br>请点「↓ 从云端拉取」核对数据是否已更新。</div>${clear}</div>`;
+}
+/* 就地刷新状态条与「云端最近一次抓取」——不整页重画，避免弹层滚动位置被重置 */
+function renderManBox() {
+  const box = $("manFetchBox"); if (box) box.innerHTML = manStatusHtml();
+  const t = $("navSyncTime");
+  if (t) {
+    const last = (DATA.settings && DATA.settings.lastNavSync) || "";
+    t.className = "note " + (last ? "g" : "");
+    t.textContent = last || "暂无记录（云端抓取任务尚未写入）";
+  }
+}
+function resetManualFetch(silent) {
+  clearTimeout(_manPollTimer); _manPolling = false;
+  MANUAL = {}; saveManual(); renderManBox();
+  if (!silent) toast("已清除手动抓取记录");
+}
+/* 触发后追踪运行结果；重开弹层 / App 重启都会接着追 */
+function ensureManualPolling() {
+  if (_manPolling || !MANUAL || MANUAL.state !== "running") return;
+  if (Date.now() > (MANUAL.t0 || 0) + 12 * 60000) {          /* 陈旧记录直接收口，别一直转圈 */
+    MANUAL.state = "timeout"; MANUAL.dur = Date.now() - (MANUAL.t0 || Date.now());
+    saveManual(); renderManBox(); return;
+  }
+  _manPolling = true;
+  _manPollTimer = setTimeout(pollManualRun, 4000);           /* 稍等一下：云端接单本身有几秒延迟 */
+}
+async function pollManualRun() {
+  clearTimeout(_manPollTimer);
+  if (!MANUAL || MANUAL.state !== "running") { _manPolling = false; return; }
+  const started = MANUAL.t0, deadline = started + 12 * 60000;
+  try {
+    if (!MANUAL.runApiId) {
+      /* 取「本次触发前后 90 秒内创建」的最新一次手动运行 */
+      const r = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/workflows/update_nav.yml/runs?event=workflow_dispatch&per_page=10`);
+      const cand = (r.workflow_runs || [])
+        .filter(x => new Date(x.created_at).getTime() >= started - 90000)
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+      if (cand) { MANUAL.runApiId = cand.id; MANUAL.runNo = cand.run_number || ""; }
+    } else {
+      const x = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/runs/${MANUAL.runApiId}`);
+      if (x.status === "completed") {
+        MANUAL.dur = Date.now() - started;
+        MANUAL.conclusion = x.conclusion || "unknown";
+        MANUAL.state = x.conclusion === "success" ? "ok" : "fail";
+        if (MANUAL.state === "ok") await collectManualResult();
+        saveManual(); _manPolling = false; renderManBox(); return;
+      }
+    }
+    MANUAL.dur = Date.now() - started;
+  } catch (e) {
+    const s = String(e);
+    if (/403/.test(s)) {   /* 令牌只有 Contents 权限时查不了运行：如实说明，别无限转圈 */
+      MANUAL.state = "unknown"; MANUAL.dur = Date.now() - started;
+      MANUAL.msg = "令牌缺少 Actions 读取权限，无法自动确认结果。";
+      saveManual(); _manPolling = false; renderManBox(); return;
+    }
+    /* 其余多为网络抖动：不算失败，下一轮再试 */
+  }
+  renderManBox();
+  if (Date.now() > deadline) {
+    MANUAL.state = "timeout"; MANUAL.dur = Date.now() - started;
+    saveManual(); _manPolling = false; renderManBox(); return;
+  }
+  _manPollTimer = setTimeout(pollManualRun, 8000);
+}
+/* 云端跑完后拉一次数据，顺便把「云端回报的抓取时间 / 新增条数」记进状态 */
+async function collectManualResult() {
+  const before = navFingerprint();
+  await syncPull(false);
+  const after = navFingerprint();
+  const lf = lastFetchInfo();
+  MANUAL.navTime = (lf && lf.time) || "";
+  MANUAL.fail = lf ? (Number(lf.fail) || 0) : 0;
+  MANUAL.added = Math.max(0, after.count - before.count);
+  saveManual();
+}
 async function triggerFetch() {
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) { toast("请先在「数据同步设置」里配置仓库与 Token"); return; }
   const btn = $("btnFetchNow");
   if (btn) { if (btn.disabled) return; btn.disabled = true; btn.textContent = "触发中…"; }
+  MANUAL = { state: "running", t0: Date.now(), runNo: "", runApiId: 0, dur: 0 };
+  saveManual(); renderManBox();
   try {
     await ghReq("POST",
       `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/workflows/update_nav.yml/dispatches`,
       { ref: "main" });
-    toast("已触发云端抓取，约 1-2 分钟后自动拉取最新净值", 4800);
-    /* 90 秒后自动拉一次（页面可见时），省得用户再来回点 */
-    clearTimeout(_fetchPullTimer);
-    _fetchPullTimer = setTimeout(() => {
-      if (document.visibilityState === "visible") syncPull(false);
-    }, 90000);
+    toast("已触发云端抓取，结果会自动出现在弹层里（约 1-4 分钟）", 4800);
+    _manPolling = false; ensureManualPolling();      /* 触发成功即开始追踪运行结果 */
   } catch (e) {
     const s = String(e);
+    MANUAL.state = "unknown"; MANUAL.dur = Date.now() - MANUAL.t0;
     if (/403/.test(s)) {
+      MANUAL.msg = "令牌缺少 Actions 权限：GitHub → 令牌设置 → Repository permissions 里 Actions 勾 Read and write（改权限不换令牌值）。";
       toast("令牌缺少 Actions 权限：GitHub → 令牌设置 → Repository permissions 里 Actions 勾 Read and write（改权限不换令牌值）", 7000);
     } else if (/404/.test(s)) {
+      MANUAL.msg = "触发失败：仓库里没有 update_nav.yml，或 Token 无权访问该仓库。";
       toast("触发失败：仓库里没有 update_nav.yml，或 Token 无权访问该仓库", 5200);
     } else {
+      MANUAL.msg = "触发失败：" + s.slice(0, 120);
       toast("触发失败：" + s.slice(0, 90), 4200);
     }
+    saveManual(); renderManBox();
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = "⚡ 立即抓取"; }
   }
@@ -2518,6 +2652,8 @@ function clearAll() {
   renderHome(); renderSet();
   renderAlert();
   if (migrated) notifyMigrate();
+  /* 上次手动抓取若在系统回收时还没跑完，启动后接着追踪（12 分钟上限自动兜底） */
+  ensureManualPolling();
   if (SYNC.owner && SYNC.repo && SYNC.token) syncPull(false);
   window.addEventListener("online", () => { if (SYNC.owner) syncPull(false); });
 
