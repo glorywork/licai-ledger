@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v33";
+const APP_VER = "v34";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -2115,7 +2115,11 @@ function refreshNav() {
       <b>采用更新的那条</b>；同一天两条线都有时用<b>官网</b>（原始披露方，避免转抄差），
       另一条线独有的历史日期会一并保留。<br><br>
       ⚠️ GitHub 的免费定时任务是「尽力而为」，实测常延迟数小时甚至跳过 ——
-      <b>嫌慢就点下面的「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。
+      <b>嫌慢就点上方「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。
+    </div>
+    <div class="row-btn" style="margin-bottom:12px">
+      <button id="btnFetchNow" class="btn pri" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取</button>
+      <button class="btn" style="flex:1" onclick="closeSheet();syncPull(true)">↓ 从云端拉取</button>
     </div>
     <div class="field"><label>云端最近一次抓取</label>
       <div id="navSyncTime" class="note ${last ? "g" : ""}">${last ? esc(last) : "暂无记录（云端抓取任务尚未写入）"}</div>
@@ -2128,10 +2132,6 @@ function refreshNav() {
     </div>
     <div class="row-btn" style="margin-top:14px">
       <button class="btn gh" style="flex:1" onclick="closeSheet();go('pg-prod')">去产品页</button>
-      <button id="btnFetchNow" class="btn pri" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取</button>
-    </div>
-    <div class="row-btn" style="margin-top:8px">
-      <button class="btn" style="flex:1" onclick="closeSheet();syncPull(true)">↓ 从云端拉取</button>
     </div>`);
   ensureManualPolling();   /* 上次手动抓取还在跑就接着追踪 */
 }
