@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v34";
+const APP_VER = "v35";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -639,7 +639,15 @@ function renderHome() {
   /* 今日/区间收益 */
   const now = new Date(); const y = now.getFullYear(), m = now.getMonth() + 1;
   let val = 0, lab = "";
-  if (UI.range === "day") { val = dayProfit(today()); lab = "今日收益"; }
+  if (UI.range === "day") {
+    /* v35（对齐 oldox 口径）：显示「最近一个已披露日」的全仓收益并标注日期与更新状态。
+       旧实现 dayProfit(today()) 配 sumDate 的 latestDateAll()，数字与日期错位——
+       今天没披露时显示「今日收益 0.00 · 2026-09-17」，看着像披露日收益为 0，误导。
+       净值多为 T+1 披露，绝大多数时间打开都该看最近披露日的收益。 */
+    const ld = latestDateAll() || today();
+    val = dayProfit(ld);
+    lab = ld === today() ? "今日收益" : "最新披露日收益";
+  }
   else if (UI.range === "week") {
     const d = new Date(now); const w = d.getDay(); const off = (w === 0 ? 6 : w - 1);
     const mon = new Date(d); mon.setDate(d.getDate() - off);
@@ -649,7 +657,9 @@ function renderHome() {
   const big = $("sumBig");
   big.textContent = signMoney(val); big.className = "big " + cls(val);
   $("sumRate").textContent = `(${val >= 0 ? "+" : ""}${pct(rate)})`; $("sumRate").className = "rate " + cls(val);
-  $("sumDate").textContent = `${lab} · ${latestDateAll() || today()}`;
+  const ldAll = latestDateAll();
+  $("sumDate").textContent = `${lab} · ${ldAll || today()}`
+    + (UI.range === "day" ? (ldAll === today() ? " · 已全部更新" : " · 今日暂未披露") : "");
   /* 月度统计 */
   const mNow = monthProfit(y, m), mPrevMonth = (m === 1 ? 12 : m - 1), mPrevYear = (m === 1 ? y - 1 : y), mPrev = monthProfit(mPrevYear, mPrevMonth);
   setStat("statM1", mNow, true); setStat("statM0", mPrev, true);
