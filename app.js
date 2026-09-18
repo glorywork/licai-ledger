@@ -16,7 +16,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
    升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v32";
+const APP_VER = "v33";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -2240,13 +2240,14 @@ function manStatusHtml() {
     const extra = m.navTime
       ? `<br>云端回报的抓取时间 <b>${esc(m.navTime)}</b>` + (m.added ? ` ｜ 本次新增净值 <b>${m.added}</b> 条` : " ｜ 暂无新增（披露源还没更新）")
       : "";
+    const late = m.lateWait ? `<br>ℹ️ 本结果在触发后 ${durTxt(m.lateWait)} 才被本机确认到（期间 App 离线或挂后台），并非云端实际耗时。` : "";
     const warn = m.fail ? `<br>⚠️ 但仍有 <b>${m.fail}</b> 只产品没拿到净值（见下方状态）` : "";
     return `<div class="note g"><b>✅ 手动抓取成功</b>
-      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${extra}${warn}</div>${clear}</div>`;
+      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${extra}${late}${warn}</div>${clear}</div>`;
   }
   if (m.state === "fail")
     return `<div class="note"><b>❌ 手动抓取失败</b>（云端结论：${esc(m.conclusion || "failure")}）
-      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b><br>
+      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${m.lateWait ? `<br>ℹ️ 本结果在触发后 ${durTxt(m.lateWait)} 才被本机确认到（期间 App 离线或挂后台）。` : ""}<br>
       到 GitHub 仓库的 Actions 页可看运行日志；整轮失败会自动建 Issue。</div>${clear}</div>`;
   if (m.state === "timeout")
     return `<div class="note"><b>⚠️ 手动抓取未在预期时间内完成</b>
@@ -2295,7 +2296,14 @@ async function pollManualRun() {
     } else {
       const x = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/actions/runs/${MANUAL.runApiId}`);
       if (x.status === "completed") {
-        MANUAL.dur = Date.now() - started;
+        /* v33：耗时改用 GitHub 记录的 run_started_at→updated_at（真实运行时长）。
+           App 挂后台/离线时轮询被冻结，Date.now()-t0 会把「确认延迟」算进耗时
+           （实测出现过「耗时 120 分 52 秒」），误导用户以为云端跑了 2 小时。 */
+        const rs = x.run_started_at ? new Date(x.run_started_at).getTime() : 0;
+        const up = x.updated_at ? new Date(x.updated_at).getTime() : 0;
+        MANUAL.dur = (rs && up && up > rs) ? (up - rs) : Math.max(0, Date.now() - started);
+        const late = Date.now() - started - MANUAL.dur;
+        MANUAL.lateWait = late > 90000 ? late : 0;   /* 确认延迟超 90 秒才提示 */
         MANUAL.conclusion = x.conclusion || "unknown";
         MANUAL.state = x.conclusion === "success" ? "ok" : "fail";
         if (MANUAL.state === "ok") await collectManualResult();
