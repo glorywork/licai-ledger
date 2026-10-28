@@ -1,0 +1,16 @@
+{
+  "name": "licai-ledger",
+  "private": true,
+  "type": "module",
+  "description": "个人理财台账 · 纯静态 PWA",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}
