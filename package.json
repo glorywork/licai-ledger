@@ -1,0 +1,11 @@
+{
+  "name": "licai-ledger",
+  "private": true,
+  "type": "module",
+  "description": "个人理财台账：纯静态 PWA，无构建步骤。此文件只为让 Node 把 .js 当 ES module（CI 的 node --check / node --test）",
+  "scripts": {
+    "test": "node --test tests/app_core.test.mjs tests/handlers.test.mjs",
+    "typecheck": "tsc -p jsconfig.json",
+    "check": "bash scripts/check-version.sh && npm run typecheck && npm test"
+  }
+}

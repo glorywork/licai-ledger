@@ -1,0 +1,43 @@
+name: Web CI
+
+# 网页仓（main）的门禁：只跑秒级的静态检查 + 纯逻辑测试，不发布、不碰数据。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 22：原生支持 .js 里的 ESM 语法检查（--check 对 import 语句的处理
+          # 在 18/20 上还有版本差异），与本地跑测试的版本保持一致
+          node-version: "22"
+
+      # APP_VER 与 sw.js 的 CACHE 必须一起加一；预缓存/引用清单里的文件必须存在
+      - name: 版本与资源一致性
+        run: bash scripts/check-version.sh
+
+      - name: 语法检查
+        run: |
+          node --check app.js
+          node --check sw.js
+          for f in js/core/*.js js/domain/*.js; do node --check "$f"; done
+
+      # JSDoc + @ts-check 的类型校验（不打包、不产物，只做静态类型检查）
+      - name: 类型检查（tsc --noEmit）
+        run: |
+          npm i --no-save --silent typescript@5.6.3
+          npx tsc -p jsconfig.json
+
+      # T+1 确认口径、净值序列、机构识别、截图 OCR 配对、内联事件桥契约
+      - name: 纯逻辑测试
+        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs

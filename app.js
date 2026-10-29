@@ -4,6 +4,21 @@
    ============================================================ */
 "use strict";
 
+/* ---------- 模块导入 ----------
+   纯逻辑拆到 js/ 下按领域分文件：core 放无状态工具与机构识别，
+   domain 放净值/持仓/OCR 这些算钱的地方。import 在模块顶层会被提升，
+   所以下面的代码可以照旧按任意顺序引用它们。
+   注意：ES module 的顶层声明**不再**自动挂到 window 上 ——
+   内联 onclick 需要的那批入口在文件末尾统一 Object.assign 回 window。 */
+import { $, pad, fmtDate, parseDate, today, money, signMoney, pct, cls, uid, esc, toast, dayDiff }
+  from "./js/core/util.js";
+import { ORG_NAME, detectOrg, detectOrgByProdCode, prodCodeOf, fetchStatus }
+  from "./js/core/orgs.js";
+import { navSeries, navAt, navOnOrBefore, latestNav, navHit } from "./js/domain/nav.js";
+import { sharesOn as sharesOnWith, hasAnyTrade as hasAnyTradeIn,
+  computePosition } from "./js/domain/position.js";
+import { ocrNavLines } from "./js/domain/ocr.js";
+
 /* ---------- 常量 ---------- */
 const LS_DATA = "licai_ledger_v1";
 const LS_SYNC = "licai_ledger_sync_v1";
@@ -13,153 +28,12 @@ const LS_SYNC = "licai_ledger_sync_v1";
    反而让另一台设备漏掉该看到的提醒。 */
 const LS_NOTIFY = "licai_ledger_notify_v1";
 const LS_ALERT = "licai_ledger_alert_v1";
-/* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（_test_dom.js 有断言守住）。
-   升版时三处一起改：这里 + sw.js 的 CACHE + _test_smoke.js 的预期值。
+/* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
+   升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v35";
+const APP_VER = "v37";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
-
-/* ---------- 机构识别 ----------
-   与云端 fetch_nav.py 的 ORG_ALIAS / detect_org() 严格对齐：
-   云端也是按「机构名 / 产品名 / 各类代码」里是否含简称来选抓取器，
-   所以前端的「能否自动抓净值」判定必须用同一套规则，否则会跟云端结论不一致。 */
-const ORG_ALIAS = [
-  ["北银", "bob"], ["北京银行", "bob"], ["bob", "bob"],
-  ["华夏", "hx"], ["hx", "hx"],
-  ["浦银", "spdb"], ["浦发", "spdb"], ["上海浦东发展", "spdb"], ["spdb", "spdb"],
-  /* 信银理财：云端 ORG_ALIAS 里「信银理财 / 信银 / 中信 / citic」四项，
-     前端必须一字不差地同序排列，否则前后端对同一产品会给出不同结论。
-     注意「中信」是或关系的子串匹配，机构栏写「中信银行」也会判为信银。 */
-  ["信银理财", "citic"], ["信银", "citic"], ["中信", "citic"], ["citic", "citic"],
-  /* 南银 / 民生：与云端 ORG_ALIAS 末尾四/三项同序同构（2026-09-12 接入）。 */
-  ["南银理财", "nanyin"], ["南银", "nanyin"], ["nanyin", "nanyin"],
-  ["民生理财", "cmbc"], ["民生", "cmbc"], ["cmbc", "cmbc"],
-  /* 宁银（宁波银行理财）：官网净值表可服务端直抓（2026-09-13 接入），
-     与云端 ORG_ALIAS 末尾三项同序同构。注意「宁银」≠「南银」。 */
-  ["宁银理财", "wmbnb"], ["宁银", "wmbnb"], ["wmbnb", "wmbnb"],
-  /* 徽银（徽商银行理财）：官网 lccs.php 列表 + lccs_income_list.php 历史表直抓
-     （2026-09-16 接入），与云端 ORG_ALIAS 末尾四项同序同构。 */
-  ["徽银理财", "huiyin"], ["徽银", "huiyin"], ["hsbank", "huiyin"], ["huiyin", "huiyin"],
-  /* 中银理财（bocwm.cn）：官网 webApi getNetWorthByCode 直抓全历史（2026-09-16 接入），
-     与云端 ORG_ALIAS 末尾三项同序同构。
-     注意「中银理财」≠「中国银行」—— 中行只是代销渠道，发行方是中银理财。 */
-  ["中银理财", "bocwm"], ["中银", "bocwm"], ["bocwm", "bocwm"],
-  /* 农银理财（abcwealth.com.cn）：官网 config.js 暴露 /awpsservice，净值接口可直抓全历史
-     （2026-09-16 接入），与云端 ORG_ALIAS 末尾四项同序同构。 */
-  ["农银理财", "nongyin"], ["农银", "nongyin"], ["abcwealth", "nongyin"], ["nongyin", "nongyin"],
-  /* 杭银理财（hzbankwealth.com.cn）：eportal 静态 JSON 一次拿全量产品最新净值
-     （2026-09-16 接入），与云端 ORG_ALIAS 末尾四项同序同构。 */
-  ["杭银理财", "hangyin"], ["杭银", "hangyin"], ["hzbankwealth", "hangyin"], ["hangyin", "hangyin"],
-  /* 兴银理财（cibwm.com.cn）：/api/public/pc/productVal/ 下拉全历史净值（2026-09-16 接入），
-     与云端 ORG_ALIAS 末尾同序同构。 */
-  ["兴银理财", "xingyin"], ["兴银", "xingyin"], ["cibwm", "xingyin"], ["xingyin", "xingyin"],
-  /* 广银理财（cgbwmc.com.cn）：Rtp 框架 SPA，POST /wmpcext/noSessionServlet/{模块}/{动作}.fun
-     整表翻页取最新净值（2026-09-16 接入）。产品代码形态极杂（1XFTLFB307A / LJR121 /
-     HYGWCY0602A …）→ 不臆造正则，靠机构名判定。 */
-  ["广银理财", "guangyin"], ["广银", "guangyin"], ["cgbwmc", "guangyin"], ["guangyin", "guangyin"],
-  /* 工银理财（wm.icbc.com.cn）：自研 KitRequest 加密通道（主/工作密钥 + HMAC-MD5 签名 +
-     AES-128-CBC 字段加密），走 clt/info/112901 列表 + 112902 明细取净值（2026-09-16 接入）。
-     产品代码形态多样（26GS6464 主码 / 26G6464A 销售码）→ 不臆造正则。 */
-  ["工银理财", "icbc"], ["工银", "icbc"], ["icbc", "icbc"]
-];
-const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银理财", citic: "信银理财",
-                   nanyin: "南银理财", cmbc: "民生理财", wmbnb: "宁银理财",
-                   huiyin: "徽银理财", bocwm: "中银理财", nongyin: "农银理财",
-                   hangyin: "杭银理财", xingyin: "兴银理财", guangyin: "广银理财",
-                   icbc: "工银理财", chinawealth: "中国理财网" };
-function detectOrg(p) {
-  if (!p) return "";
-  const hay = [p.inst, p.manager, p.name, p.prodCode, p.code]
-    .map(v => String(v == null ? "" : v)).join(" ").toLowerCase();
-  for (const [alias, code] of ORG_ALIAS) { if (hay.indexOf(alias) >= 0) return code; }
-  /* 通用规则（与云端 detect_org 同构）：名称/机构含「理财」→ 中国理财网通用
-     聚合源（覆盖招银/工银/中银/交银/宁银/苏银等全部 32 家发行方）。
-     已接入机构在 ORG_ALIAS 里优先命中，走各自官网抓取器（历史更全）。 */
-  if (hay.indexOf("理财") >= 0) return "chinawealth";
-  /* 兜底（与云端同构）：机构未识别但登记编码 Z 开头（Z+12~14 位数字）。 */
-  const reg = String(p.regCode || p.zcode || p.instCode || p.shareCode || p.code || "")
-    .trim().toUpperCase();
-  if (/^Z\d{12,14}$/.test(reg)) return "chinawealth";
-  return "";
-}
-/* 仅凭「产品代码」形态推测机构——只用于输入时的实时提示。
-   权威判定始终以 detectOrg()（机构名/产品名）为准。
-   注：浦银官网接口实际按「登记编码」查询，未发现可靠的产品代码前缀规律，
-       故此处不臆造规则，改为提示用户填登记编码。 */
-const PRODCODE_RULES = [
-  [/^YJ\d{6,}[A-Z]?$/i, "bob", "北银产品代码：YJ + 数字（可带份额后缀字母）"],
-  [/^\d{12}$/, "hx", "华夏产品代码：12 位数字"],
-  /* 信银份额代码 = 2 位前缀 + 6 位数字 + 1 位份额字母（共 9 位），如 AF251387C。
-     前缀 AF / AM 为公募，BF / BB 为私募；私募净值披露受限，云端可能抓不到历史。
-     7 位母产品代码（去掉末位份额字母）在信银官网查不到，故此处要求末位字母必填。 */
-  [/^(?:AF|AM|BF|BB)\d{6}[0-9A-Z]$/i, "citic", "信银产品代码：AF/AM/BF/BB + 6 位数字 + 份额字母（如 AF251387C）"],
-  /* 信银「母产品代码」：AF/AM/BF/BB + 6 位数字，缺了末位份额字母。
-     信银官网只认 9 位份额代码，8 位母代码一律返回「未查询到该产品信息」，
-     所以这里必须单独提醒补全，否则用户会以为云端抓取坏了。 */
-  [/^(?:AF|AM|BF|BB)\d{6}$/i, "citic", "⚠️ 这像是信银的母产品代码（缺末位份额字母），必须补上份额字母才能查到净值"],
-  /* 南银：10 位销售代码 NYYW + 6 位数字，如 NYYW000016。
-     官网加密接口只认销售代码，登记编码（Z 开头）可由云端自动反查补齐。 */
-  [/^NYYW\d{6}$/i, "nanyin", "南银销售代码：NYYW + 6 位数字（如 NYYW000016）"],
-  /* 民生：10 位产品代码 F + 3 位字母 + 5 位数字 + 份额字母，如 FBAG65601C。
-     实测全集前缀 FBAG/FBAE/FBAF/FSAE/FSAF/FSAG/FGAE/FGAG/FGAF；登记编码查询 0 命中。 */
-  [/^F[A-Z]{3}\d{5}[A-Z]$/i, "cmbc", "民生产品代码：F + 3 位字母 + 5 位数字 + 份额字母（如 FBAG65601C）"],
-  /* 宁银：Z + 2 位字母 + 7 位数字 + 份额字母，如 ZGN2360006C。官网净值表按此份额代码查询。 */
-  [/^Z[A-Z]{2}\d{7}[A-Z]$/i, "wmbnb", "宁银产品代码：Z + 2 位字母 + 7 位数字 + 份额字母（如 ZGN2360006C）"],
-  /* 徽银：PNHY + 6 位数字 +（可带下划线）+ 份额字母，如 PNHY260367F / PNHY240108_B。
-     官网 lccs.php 列表按此代码定位产品；比对时云端会忽略下划线。 */
-  [/^PNHY\d{6}_?[A-Z]$/i, "huiyin", "徽银产品代码：PNHY + 6 位数字 +（可带 _）+ 份额字母（如 PNHY260367F）"]
-];
-function detectOrgByProdCode(code) {
-  const s = String(code == null ? "" : code).trim();
-  if (!s) return { org: "", tip: "" };
-  for (const [re, org, tip] of PRODCODE_RULES) { if (re.test(s)) return { org, tip }; }
-  if (/^Z\d{10,}$/i.test(s)) return { org: "", tip: "这看起来是「登记编码」——请填到上方登记编码栏；填好后云端会走中国理财网通用查询（覆盖全部发行方）" };
-  return { org: "", tip: "" };
-}
-/* 云端抓取所需的产品代码（fetch_nav.py 的 get_prod_code：prodCode → code → shareCode） */
-function prodCodeOf(p) {
-  if (!p) return "";
-  for (const k of ["prodCode", "code", "shareCode"]) {
-    const v = String(p[k] == null ? "" : p[k]).trim();
-    if (v) return v;
-  }
-  return "";
-}
-/* 云端抓取就绪状态（与云端逻辑对齐）：
-   常规机构：必须填「产品代码」；中国理财网聚合源：凭登记编码（Z 开头）即可查询。 */
-function fetchStatus(p) {
-  const code = String(p && p.prodCode || "").trim();
-  const org = detectOrg(p);
-  const reg = String((p && (p.regCode || p.code)) || "").trim().toUpperCase();
-  const hasReg = /^Z\d{12,14}$/.test(reg);
-  const nm = String((p && p.name) || "").trim();
-  /* 按产品名称搜索只在名称足够完整时才有意义（"某产品"这类短名在信披平台搜不到），
-     故要求 6 字以上 —— 与云端「按名搜索」的实际可用性对齐。 */
-  const hasName = nm.length >= 6;
-  /* 中国理财网信披平台：登记编码（精确）或完整产品名称（模糊）任一即可查，覆盖任意发行方 */
-  const cwVia = hasReg ? "按登记编码" : (hasName ? "按产品名称" : "");
-  /* 发行方官网抓取器：只认「产品代码」 */
-  const official = org && org !== "chinawealth" && ORG_NAME[org];
-
-  if (official && code) {
-    /* 两条线都能跑 —— 云端会同时抓、自动择优（更新的胜，同日以官网为准） */
-    return { ok: true, lv: "ok", txt: `✓ 双线自动抓取（${ORG_NAME[org]}官网 + 中国理财网）` };
-  }
-  if (official && !code) {
-    return cwVia
-      ? { ok: true, lv: "ok", txt: `✓ 中国理财网可抓（${cwVia}）—— 补填「产品代码」还能叠加 ${ORG_NAME[org]} 官网（历史更全）` }
-      : { ok: false, lv: "warn", txt: `⚠️ 缺产品代码：${ORG_NAME[org]} 官网按产品代码查询；也可填登记编码（Z 开头）走中国理财网` };
-  }
-  if (cwVia) {
-    return { ok: true, lv: "ok", txt: `✓ 中国理财网可自动抓最新净值（${cwVia}）` };
-  }
-  if (org === "chinawealth") {
-    return { ok: false, lv: "warn", txt: "⚠️ 中国理财网查询需填登记编码（Z 开头）或完整产品名称" };
-  }
-  if (!org) return { ok: false, lv: "warn", txt: "⚠️ 机构未识别（机构栏填理财公司全名如「招银理财/工银理财」，或填 Z 开头登记编码走中国理财网）" };
-  return { ok: false, lv: "warn", txt: "⚠️ 缺产品代码，云端无法抓净值" };
-}
 
 /* 本轮抓取「这条净值是从哪条线来的」——云端每次抓取都会对同一产品同时查
    【官网抓取器】与【中国理财网聚合源】，自动择优，结果写在
@@ -221,30 +95,6 @@ let NOTIFY = { on: false, lastCheck: 0 };
 let ALERT_DISMISSED = "";
 let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7", detQ: "", detInst: "", detSort: "dayP", detAsc: false };
 
-/* ---------- 工具 ---------- */
-const $ = id => document.getElementById(id);
-const pad = n => String(n).padStart(2, "0");
-const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const parseDate = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
-const today = () => fmtDate(new Date());
-/* 金额格式化。
-   ⚠️ 必须先把入参转成数字：历史数据或手工改过的 licai-data.json 里 amount 可能是
-   undefined/null，直接 .toLocaleString 会抛异常并把整个列表渲染打断（页面白屏）。 */
-const money = n => {
-  const v = Number(n) || 0;
-  return (Math.abs(v) < 0.005 ? 0 : v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-};
-const signMoney = n => (n > 0 ? "+" : n < 0 ? "-" : "") + money(Math.abs(n));
-const pct = n => (n * 100).toFixed(2) + "%";
-const cls = n => n > 0 ? "up" : n < 0 ? "down" : "muted";
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
-function toast(msg, ms = 2000) {
-  const t = $("toast"); t.textContent = msg; t.classList.add("show");
-  clearTimeout(t._tm); t._tm = setTimeout(() => t.classList.remove("show"), ms);
-}
-function dayDiff(a, b) { return Math.round((parseDate(b) - parseDate(a)) / 86400000); }
 /* ---------- 持久化 ---------- */
 /* （workdaysBetween 已删除：定义后从未被调用，且容易让人误以为 T+1 用工作日口径 —— 2026-09-15 审查清理） */
 let STORAGE_BAD = false;   /* 只提示一次，成功后自动复位 */
@@ -398,33 +248,6 @@ function notifyMigrate() {
 /* ============================================================
    收益计算核心
    ============================================================ */
-/* 产品按日期升序的净值序列 */
-function navSeries(p) {
-  return Object.keys(p.navHistory || {}).sort().map(d => [d, Number(p.navHistory[d])]);
-}
-function navAt(p, date) { return p.navHistory ? p.navHistory[date] : undefined; }
-/* 取 <= date 的最近一个净值 */
-function navOnOrBefore(p, date) {
-  const s = navSeries(p); let r = null;
-  for (const [d, v] of s) { if (d <= date) r = [d, v]; else break; }
-  return r;
-}
-/* 最新净值 */
-function latestNav(p) { const s = navSeries(p); return s.length ? s[s.length - 1] : null; }
-/* 统一「当天命中 → 否则向前取最近」的取值：始终返回 [日期, 净值] 或 null。
-   ⚠️ 不要写成 `navAt(p,d) || navOnOrBefore(p,d)`：navAt 命中时返回的是「数字」，
-   navOnOrBefore 返回的是「数组」，|| 短路会让调用方拿到两种类型 ——
-   命中路径下 hit[1] 取到 undefined，Number(undefined) = NaN，
-   再被下游 `nav > 0` 之类的守卫静默退化成 0，表现为「净值栏被清空 / 份额算成 0」。 */
-function navHit(p, date) {
-  const v = navAt(p, date);
-  if (v !== undefined && v !== null && v !== "") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return [date, n];
-  }
-  return navOnOrBefore(p, date);
-}
-
 /* ---------- 确认口径（T+1）----------
    理财产品申购/赎回都是「T 日申请、T+1 日确认」，确认日之前份额未到账：
      · 不计入持仓份额与市值
@@ -432,21 +255,10 @@ function navHit(p, date) {
    所以凡是要「结算到某一天为止」的地方，都不能直接用 position().shares（那是今天的），
    要用 sharesOn(p, date) —— 否则历史日历/区间收益会拿今天的份额去乘过去的净值差。 */
 
-/* 截至 date 已确认的持仓份额（只累加确认日 <= date 的交易） */
-function sharesOn(p, date) {
-  let sh = 0;
-  for (const t of DATA.trades) {
-    if (t.prodId !== p.id) continue;
-    const cd = t.confirmDate || t.tradeDate || "";
-    if (!cd || cd > date) continue;              /* 未确认：份额还没到账 */
-    if (t.type === "buy") sh += tradeShares(t, p);
-    else sh = Math.max(0, sh - (Number(t.shares) || 0));
-  }
-  return sh;
-}
-
-/* 该产品是否有过交易（用于区分「已清仓」与「从未建仓」） */
-function hasAnyTrade(p) { return DATA.trades.some(t => t.prodId === p.id); }
+/* 兼容旧调用签名：交易列表统一取 DATA.trades（纯函数实现在 js/domain/position.js）。
+   保留这层薄壳，日历/区间收益/明细等 40+ 处调用点不用逐个改参数。 */
+function sharesOn(p, date) { return sharesOnWith(p, DATA.trades, date); }
+function hasAnyTrade(p) { return hasAnyTradeIn(p, DATA.trades); }
 
 /* 该日是否有任一产品披露了净值。
    用来区分「未披露」（无数据，不该显示成 0）与「收益为 0」（有净值但持平）。 */
@@ -457,28 +269,10 @@ function dayDisclosed(date) {
   });
 }
 
-/* 某交易发生的确认净值：优先用户填的，否则取确认日（或买入日）当天净值 */
-function resolveTradeNav(t, p) {
-  if (t.confirmNav) return Number(t.confirmNav);
-  const d = t.confirmNavDate || t.confirmDate || t.tradeDate;
-  const hit = navHit(p, d);
-  return hit ? Number(hit[1]) : 0;
-}
-
-/* 计算份额 & 成本 */
-function tradeShares(t, p) {
-  const nav = resolveTradeNav(t, p);
-  if (t.type === "buy") {
-    if (t.shares) return Number(t.shares);
-    return nav > 0 ? Number(t.amount) / nav : 0;
-  } else {
-    return Number(t.shares || 0);
-  }
-}
-
 /* 某产品当前持仓：份额、成本（成本法：加权平均）
    确认口径：只有确认日 <= 今天的买入才计入 shares/cost；
-   确认日 > 今天的买入进 pendingShares/pendingAmount（在途），不计息、不显示市值。 */
+   确认日 > 今天的买入进 pendingShares/pendingAmount（在途），不计息、不显示市值。
+   算法本体在 js/domain/position.js（纯函数 computePosition）；这里只保留缓存。 */
 /* position 结果缓存（v32 P1-3）：渲染热路径每轮反复调 position/portfolio，
    全量重算 O(产品×交易)。以「数据版本号 + 当天日期」为键 ——
    任何 saveLocal 都会 bump _POS_VER；跨天由 day 比对自动失效。 */
@@ -487,48 +281,7 @@ function position(p) {
   const td = today();
   const _ck = _posCache.get(p.id);
   if (_ck && _ck.ver === _POS_VER && _ck.day === td) return _ck.pos;
-  const ts = DATA.trades.filter(t => t.prodId === p.id)
-    .sort((a, b) => (a.confirmDate || a.tradeDate || "").localeCompare(b.confirmDate || b.tradeDate || ""));
-  let shares = 0, cost = 0, realized = 0;
-  let pendingShares = 0, pendingAmount = 0, startDate = "";
-  for (const t of ts) {
-    const cd = t.confirmDate || t.tradeDate || "";
-    const confirmed = !cd || cd <= td;
-    if (t.type === "buy") {
-      const sh = tradeShares(t, p); const amt = Number(t.amount) || 0;
-      if (!confirmed) { pendingShares += sh; pendingAmount += amt; continue; }
-      if (!startDate) startDate = cd;
-      shares += sh; cost += amt;
-    } else {
-      if (!confirmed) continue;                /* 赎回确认前，持仓不动 */
-      /* 赎回：按当前均价成本扣减，差额计入已实现 */
-      const sh = Math.min(Number(t.shares) || 0, shares);
-      const nav = Number(t.confirmNav) || resolveTradeNav(t, p) || 0;
-      const avg = shares > 0 ? cost / shares : 0;
-      const proceeds = sh * nav;
-      const costOut = avg * sh;
-      realized += (proceeds - costOut);
-      shares -= sh; cost -= costOut;
-      if (shares < 1e-9) { shares = 0; cost = 0; }
-    }
-  }
-  const last = latestNav(p);
-  const lastNav = last ? last[1] : 0;
-  const lastDate = last ? last[0] : "";
-  /* 在途：有买入但一份都没确认 → 不显示市值/收益（由 UI 显示 "-"） */
-  const hasPending = pendingShares > 0;
-  const inTransit = shares <= 0 && hasPending;
-  const market = inTransit ? 0 : shares * lastNav;
-  const profit = market - cost;               /* 持仓浮盈 */
-  /* 持有天数与年化 */
-  const holdDays = startDate ? Math.max(dayDiff(startDate, lastDate || td), 1) : 0;
-  let holdAnnual = (cost > 0 && holdDays > 0) ? (profit / cost) * 365 / holdDays : 0;
-  /* 持有不足 7 天时，年化会把短期波动放大成极端值（如 2 天 3% → 571%），
-     横截面上会误导用户。低于 7 天不给年化，改由页面展示"持有不足"提示。 */
-  const annualValid = holdDays >= 7;
-  if (!annualValid) holdAnnual = 0;
-  const pos = { shares, cost, market, profit, realized, lastNav, lastDate, startDate, holdDays, holdAnnual, annualValid,
-           pendingShares, pendingAmount, hasPending, inTransit, navSeries: navSeries(p) };
+  const pos = computePosition(p, DATA.trades, td);
   _posCache.set(p.id, { ver: _POS_VER, day: td, pos: pos });
   return pos;
 }
@@ -1056,6 +809,7 @@ function renderSet() {
        </div>`
     : `<div class="note">尚未连接云端。配置后即可多设备共享同一份台账数据。</div>`;
   $("syncState").textContent = ok ? "已连接" : "未连接";
+  renderAixhub();
   renderNotify();
 }
 
@@ -1824,6 +1578,11 @@ function renderProdDetail() {
       <div class="stat"><div class="l">成立以来年化</div><div class="v ${cls(since === null ? 0 : since)}">${pctFmt(since)}</div><div class="cap">首末净值折算 · 全周期</div></div>
     </div>
     <div class="cap" style="padding:6px 0 0">样本不足时显示「—」，不估算、不补齐；净值型产品官方不披露万份收益与年化，以上均为本工具折算口径。</div>
+    ${(latestDate && nativeFetchAvailable() && (Date.now() - parseDate(latestDate).getTime()) > 36 * 3600000)
+      ? `<div class="tip" style="margin-top:6px">⏳ 公开渠道最新到 <b>${esc(latestDate)}</b>。${aixhubToken()
+          ? `已登录<b>秒讯</b>：点「⚡ 立即抓取」会用它的数据（通常早上就有）；北银官网在开放日次日 11:00–15:00 才上传。`
+          : `北银官网在开放日次日 11:00–15:00 上传净值（汇总表与公告表两张表都会查），App 在前台时每 3 分钟自动核对，上传后几分钟内就会补上。想在早上就看到，可到「设置 → 秒讯」登录（可选）。`}</div>`
+      : ""}
 
     ${pos.shares > 0 ? `<div class="card-t" style="margin:14px 0 8px"><h2 style="font-size:14px">我的持仓</h2></div>
     <div class="grid2">
@@ -1977,6 +1736,81 @@ function parseNavText(text, existing) {
   return { rows, counts };
 }
 
+/* ============================================================
+   截图识别净值（App 内 ML Kit，离线；图片不离开手机）
+   ------------------------------------------------------------
+   微众等代销 App 的净值在登录态里，外部程序拿不到公开接口。
+   这里走「你自己截图 → 本机 OCR → 填进上面的粘贴框 → 你核对后写入」，
+   不碰任何账号密码，也不绕过对方的鉴权。
+   ============================================================ */
+const _ocrDone = {};
+window.__ocrDone = function (id, res) {
+  const f = _ocrDone[id]; if (!f) return;
+  delete _ocrDone[id]; f(res);
+};
+function ocrPick(pid) {
+  if (!window.NativeNav || !window.NativeNav.ocr) return toast("截图识别只在 App 内可用；网页版请直接粘贴", 4200);
+  const el = $("ocrFile"); if (!el) return;
+  try { el.value = ""; } catch (e) { }
+  el.click();
+}
+function ocrBridge(b64) {
+  return new Promise(resolve => {
+    if (!window.NativeNav || !window.NativeNav.ocr) return resolve({ ok: false, message: "仅 App 内可用" });
+    const id = "o" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const timer = setTimeout(() => { delete _ocrDone[id]; resolve({ ok: false, message: "识别超时" }); }, 35000);
+    _ocrDone[id] = r => { clearTimeout(timer); resolve(r || { ok: false }); };
+    try { window.NativeNav.ocr(id, b64); }
+    catch (e) { clearTimeout(timer); delete _ocrDone[id]; resolve({ ok: false, message: String(e) }); }
+  });
+}
+/* 压缩到最长边 1600：截图通常 2–4MB，压完几百 KB，识别更快也不会撑爆桥 */
+function fileToJpegBase64(file, maxSide) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(new Error("读图失败"));
+    fr.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("图片格式不支持"));
+      img.onload = () => {
+        const m = maxSide || 1600;
+        const k = Math.min(1, m / Math.max(img.width || 1, img.height || 1));
+        const w = Math.max(1, Math.round((img.width || 1) * k));
+        const h = Math.max(1, Math.round((img.height || 1) * k));
+        const cv = document.createElement("canvas");
+        cv.width = w; cv.height = h;
+        cv.getContext("2d").drawImage(img, 0, 0, w, h);
+        const url = cv.toDataURL("image/jpeg", 0.86);
+        resolve(url.slice(url.indexOf(",") + 1));
+      };
+      img.src = String(fr.result || "");
+    };
+    fr.readAsDataURL(file);
+  });
+}
+/* OCR 文本 → 「日期 净值」行：日期与数字可能同一行，也可能上下相邻两行 */
+async function ocrShot(pid, input) {
+  const f = input && input.files && input.files[0];
+  if (!f) return;
+  toast("识别中…（本机处理，图片不上传）", 2600);
+  try {
+    const b64 = await fileToJpegBase64(f, 1600);
+    const r = await ocrBridge(b64);
+    if (!r || !r.ok) return toast((r && r.message) || "识别失败", 4200);
+    const rows = ocrNavLines(r.text);
+    if (!rows.length) return toast("没认出「日期 + 净值」，截图要带上日期和净值数字", 5200);
+    const box = $("nBulk"); if (!box) return;
+    const old = box.value.trim();
+    const add = rows.filter(x => old.indexOf(x.split(" ")[0]) < 0);
+    UI.navDraft = (old ? old + "\n" : "") + add.join("\n");
+    box.value = UI.navDraft;
+    bulkNav(pid);
+    toast(add.length ? "认出 " + add.length + " 条，核对后点下方写入" : "这些日期本地已有，不用重复写", 4200);
+  } catch (e) {
+    toast("识别失败：" + String(e.message || e).slice(0, 50), 4200);
+  }
+}
+
 function openNav(pid) {
   const p = DATA.products.find(x => x.id === pid); if (!p) return;
   const s = navSeries(p).slice().reverse();
@@ -1997,6 +1831,9 @@ function openNav(pid) {
         <label><input type="checkbox" id="nBulkOver" onchange="bulkNav('${pid}')"> 覆盖同日已有净值</label>
         <label><input type="checkbox" id="nBulkWarn" onchange="bulkNav('${pid}')"> 写入可疑行</label>
       </div>
+      <button class="btn gh full" style="margin-top:8px" onclick="ocrPick('${pid}')">📷 截图识别净值</button>
+      <input type="file" id="ocrFile" accept="image/*" style="display:none" onchange="ocrShot('${pid}', this)">
+      <div class="tip">微众/其他 App 的产品页截个图就行，识别在本机完成、图片不上传；认出的行会先放进上面的粘贴框，核对后再写入。</div>
       <div id="nBulkPrev"></div>
     </div>
     <div class="field"><label>已有净值（${s.length} 条）</label>
@@ -2116,7 +1953,17 @@ function refreshNav() {
   const ready = DATA.products.filter(p => fetchStatus(p).ok).length;
   openSheet(`<div class="sheet-t"><h3>净值更新说明</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="note b" style="margin-bottom:12px">
-      净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 / 信银 / 南银 / 民生 官网均设置了跨域限制（CORS）或加密/风控，
+      ${nativeFetchAvailable() ? `App 内置抓取器<b>直接在本机</b>访问各披露源，不受浏览器跨域限制，
+      也不依赖 GitHub 定时任务。<br><br>
+      打开 App / 切回前台会<b>自动核对</b>：只要还有产品没披露到昨天，就<b>每 3 分钟</b>查一次；
+      全部追上后降到每 30 分钟一次。抓到即落盘并自动推送，不需要手动操作。<br><br>
+      <b>每条净值都会并发查两条线</b>：<b>① 发行方官网</b>与<b>② 中国理财网信披平台</b>，
+      自动采用更新的一条；同一天都有时用官网（原始披露方）。${aixhubToken()
+        ? `<br>已登录<b>秒讯</b>：只有点「⚡ 立即抓取」时才顺带查它一次（后台轮询不碰它）。`
+        : `<br>想要更早半天看到，可在「设置 → 秒讯」登录（可选，不登录不影响上面的抓取）。`}<br><br>
+      ⓘ 公开披露本身有滞后（通常开放日次日～次二日）。发行方还没披露的日期，
+      任何公开渠道都拿不到 —— 下面会列出两个源各自的最新日期。急用可点「⚡ 立即抓取」强制核对一次。`
+      : `净值<b>不再由浏览器抓取</b>。北银 / 华夏 / 浦银 / 信银 / 南银 / 民生 官网均设置了跨域限制（CORS）或加密/风控，
       页面直连会被浏览器拦截 —— 这正是原「每日更新」按钮点了没反应的原因。<br><br>
       现在由云端 <b>GitHub Actions</b> 每天 <b>00:00 / 06:00 / 08:00</b> 自动抓取官方公开披露的净值，
       提交到你的私有仓库。<br><br>
@@ -2125,7 +1972,7 @@ function refreshNav() {
       <b>采用更新的那条</b>；同一天两条线都有时用<b>官网</b>（原始披露方，避免转抄差），
       另一条线独有的历史日期会一并保留。<br><br>
       ⚠️ GitHub 的免费定时任务是「尽力而为」，实测常延迟数小时甚至跳过 ——
-      <b>嫌慢就点上方「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。
+      <b>嫌慢就点上方「⚡ 立即抓取」</b>，手动触发不受排队影响，1-2 分钟出结果。`}
     </div>
     <div class="row-btn" style="margin-bottom:12px">
       <button id="btnFetchNow" class="btn pri" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取</button>
@@ -2238,33 +2085,43 @@ function durTxt(ms) {
    触发时间 / 运行号 / 耗时 / 云端回报的抓取时间 / 新增条数都摊开写清楚。 */
 function manStatusHtml() {
   const m = MANUAL || {};
-  if (!m.t0) return `<div class="note">还没有手动抓取记录。点下面的「⚡ 立即抓取」可立刻触发一次云端抓取，不受定时排队影响。</div>`;
+  if (!m.t0) return `<div class="note">还没有抓取记录。点下面的「⚡ 立即抓取」${nativeFetchAvailable()
+    ? "即可在本机直接抓取（不经过云端队列，通常几十秒出结果）。"
+    : "可立刻触发一次云端抓取，不受定时排队影响。"}</div>`;
+  const nat = !!m.native;
   const at = stampOf(m.t0);
+  const what = nat ? "本机抓取" : "手动抓取";
   const run = m.runNo ? ` ｜ 运行 <b>#${esc(m.runNo)}</b>` : "";
   const clear = `<div style="margin-top:6px"><span class="more" onclick="resetManualFetch()">清除这条记录 ›</span></div>`;
   if (m.state === "running")
-    return `<div class="note b"><b>⏳ 手动抓取进行中…</b>
-      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run}${m.dur ? " ｜ 已等 " + durTxt(m.dur) : ""}<br>
-      ${m.runNo ? "云端正在抓取，通常 1-4 分钟。" : "已提交，等待云端接单…"}本页可继续使用，出结果后这里会自动更新。</div></div>`;
+    return `<div class="note b"><b>⏳ ${what}进行中…</b>
+      <div class="tip" style="color:inherit;margin-top:4px">${nat
+        ? `开始时间 <b>${esc(at)}</b> ｜ 已处理 <b>${m.done || 0} / ${m.total || 0}</b> 只产品`
+        : `触发时间 <b>${esc(at)}</b>${run}${m.dur ? " ｜ 已等 " + durTxt(m.dur) : ""}`}<br>
+      ${nat ? "本机直接访问披露源，结果会逐只回填。" : (m.runNo ? "云端正在抓取，通常 1-4 分钟。" : "已提交，等待云端接单…")}本页可继续使用，出结果后这里会自动更新。</div></div>`;
   if (m.state === "ok") {
-    const extra = m.navTime
-      ? `<br>云端回报的抓取时间 <b>${esc(m.navTime)}</b>` + (m.added ? ` ｜ 本次新增净值 <b>${m.added}</b> 条` : " ｜ 暂无新增（披露源还没更新）")
-      : "";
-    const late = m.lateWait ? `<br>ℹ️ 本结果在触发后 ${durTxt(m.lateWait)} 才被本机确认到（期间 App 离线或挂后台），并非云端实际耗时。` : "";
-    const warn = m.fail ? `<br>⚠️ 但仍有 <b>${m.fail}</b> 只产品没拿到净值（见下方状态）` : "";
-    return `<div class="note g"><b>✅ 手动抓取成功</b>
-      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${extra}${late}${warn}</div>${clear}</div>`;
+    const extra = nat
+      ? (m.added ? `<br>本次新增净值 <b>${m.added}</b> 条`
+        : `<br>暂无新增（披露源还没更新到更新的一天）`)
+      : (m.navTime
+        ? `<br>云端回报的抓取时间 <b>${esc(m.navTime)}</b>` + (m.added ? ` ｜ 本次新增净值 <b>${m.added}</b> 条` : " ｜ 暂无新增（披露源还没更新）")
+        : "");
+    const late = (!nat && m.lateWait) ? `<br>ℹ️ 本结果在触发后 ${durTxt(m.lateWait)} 才被本机确认到（期间 App 离线或挂后台），并非云端实际耗时。` : "";
+    const warn = m.fail ? `<br>⚠️ 但仍有 <b>${m.fail}</b> 只产品没拿到净值${m.msg ? "：" + esc(m.msg) : ""}` : "";
+    return `<div class="note g"><b>✅ ${what}成功</b>
+      <div class="tip" style="color:inherit;margin-top:4px">${nat ? "开始" : "触发"}时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${extra}${late}${warn}</div>${clear}</div>`;
   }
   if (m.state === "fail")
-    return `<div class="note"><b>❌ 手动抓取失败</b>（云端结论：${esc(m.conclusion || "failure")}）
-      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${m.lateWait ? `<br>ℹ️ 本结果在触发后 ${durTxt(m.lateWait)} 才被本机确认到（期间 App 离线或挂后台）。` : ""}<br>
-      到 GitHub 仓库的 Actions 页可看运行日志；整轮失败会自动建 Issue。</div>${clear}</div>`;
+    return `<div class="note"><b>❌ ${what}失败</b>${m.conclusion ? `（云端结论：${esc(m.conclusion)}）` : ""}
+      <div class="tip" style="color:inherit;margin-top:4px">${nat ? "开始" : "触发"}时间 <b>${esc(at)}</b>${run} ｜ 耗时 <b>${durTxt(m.dur)}</b>${m.msg ? `<br>${esc(m.msg)}` : ""}
+      <br>${nat ? "可点「⚡ 立即抓取」重试；仍未取到就说明披露源当日还没更新。" : "到 GitHub 仓库的 Actions 页可看运行日志；整轮失败会自动建 Issue。"}</div>${clear}</div>`;
   if (m.state === "timeout")
-    return `<div class="note"><b>⚠️ 手动抓取未在预期时间内完成</b>
-      <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run}<br>
-      已等超过 12 分钟仍未拿到结论（GitHub 免费账号偶发排队）。可点「↓ 从云端拉取」直接看数据到没到。</div>${clear}</div>`;
-  return `<div class="note"><b>⚠️ 手动抓取未能确认结果</b>
-    <div class="tip" style="color:inherit;margin-top:4px">触发时间 <b>${esc(at)}</b>${run}<br>${esc(m.msg || "")}<br>请点「↓ 从云端拉取」核对数据是否已更新。</div>${clear}</div>`;
+    return `<div class="note"><b>⚠️ ${what}未在预期时间内完成</b>
+      <div class="tip" style="color:inherit;margin-top:4px">${nat ? "开始" : "触发"}时间 <b>${esc(at)}</b>${run}<br>
+      ${nat ? (m.msg ? esc(m.msg) : "App 可能被系统回收或网络中断，重试即可。")
+        : "已等超过 12 分钟仍未拿到结论（GitHub 免费账号偶发排队）。可点「↓ 从云端拉取」直接看数据到没到。"}</div>${clear}</div>`;
+  return `<div class="note"><b>⚠️ ${what}未能确认结果</b>
+    <div class="tip" style="color:inherit;margin-top:4px">${nat ? "开始" : "触发"}时间 <b>${esc(at)}</b>${run}${m.msg ? "<br>" + esc(m.msg) : ""}<br>请点「↓ 从云端拉取」核对数据是否已更新。</div>${clear}</div>`;
 }
 /* 就地刷新状态条与「云端最近一次抓取」——不整页重画，避免弹层滚动位置被重置 */
 function renderManBox() {
@@ -2283,6 +2140,15 @@ function resetManualFetch(silent) {
 }
 /* 触发后追踪运行结果；重开弹层 / App 重启都会接着追 */
 function ensureManualPolling() {
+  /* 本机抓取没有 run id 可查；只需收口「App 被杀导致一直转圈」的陈旧记录 */
+  if (MANUAL && MANUAL.native) {
+    if (MANUAL.state === "running" && Date.now() > (MANUAL.t0 || 0) + 3 * 60000) {
+      MANUAL.state = "timeout"; MANUAL.dur = Date.now() - (MANUAL.t0 || 0);
+      MANUAL.msg = "上次本机抓取未完成（App 可能被系统回收或网络中断）。";
+      saveManual(); renderManBox();
+    }
+    return;
+  }
   if (_manPolling || !MANUAL || MANUAL.state !== "running") return;
   if (Date.now() > (MANUAL.t0 || 0) + 12 * 60000) {          /* 陈旧记录直接收口，别一直转圈 */
     MANUAL.state = "timeout"; MANUAL.dur = Date.now() - (MANUAL.t0 || Date.now());
@@ -2349,6 +2215,8 @@ async function collectManualResult() {
   saveManual();
 }
 async function triggerFetch() {
+  /* App 内（WebView + 内置 CPython）走本机抓取；网页端仍然派发云端 Actions */
+  if (nativeFetchAvailable()) return nativeFetchAll(true);
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) { toast("请先在「数据同步设置」里配置仓库与 Token"); return; }
   const btn = $("btnFetchNow");
   if (btn) { if (btn.disabled) return; btn.disabled = true; btn.textContent = "触发中…"; }
@@ -2388,6 +2256,240 @@ async function triggerFetch() {
     if (btn) { btn.disabled = false; btn.textContent = "⚡ 立即抓取"; }
   }
 }
+/* ============================================================
+   本机抓取（仅 Android App 内生效）
+   ------------------------------------------------------------
+   网页端没有 window.NativeNav，本整段代码不会被触发，仍然走云端 Actions。
+   App 内由 NavBridge 调起内置 CPython 的 navservice.fetch_one → fetch_nav.py，
+   合并规则（已有净值不覆盖 + 单日 >10% 跳变拦截）完全复用 Python 的
+   merge_nav，前端只负责落盘、渲染与推送，避免两套算法漂移。
+   ============================================================ */
+const _navDone = {};
+let _nativeBusy = false;
+
+/* ---------- 秒讯（可选）：邮箱验证码登录，token 只存本机 ---------- */
+const AIX_LS = { token: "licai.aixhubToken", email: "licai.aixhubEmail", at: "licai.aixhubAt" };
+const _aixDone = {};
+function aixhubToken() { try { return localStorage.getItem(AIX_LS.token) || ""; } catch (e) { return ""; } }
+function aixhubEmail() { try { return localStorage.getItem(AIX_LS.email) || ""; } catch (e) { return ""; } }
+window.__aixDone = function (id, res) {
+  const f = _aixDone[id]; if (!f) return;
+  delete _aixDone[id]; f(res);
+};
+function aixhubBridge(method, args) {
+  return new Promise(resolve => {
+    if (!nativeFetchAvailable()) return resolve({ ok: false, message: "秒讯登录只在 Android App 内可用" });
+    const id = "a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const timer = setTimeout(() => { delete _aixDone[id]; resolve({ ok: false, message: "超时，请重试" }); }, 30000);
+    _aixDone[id] = r => { clearTimeout(timer); resolve(r || { ok: false }); };
+    try { window.NativeNav[method].apply(window.NativeNav, [id].concat(args)); }
+    catch (e) { clearTimeout(timer); delete _aixDone[id]; resolve({ ok: false, message: String(e) }); }
+  });
+}
+async function aixhubLoginFlow() {
+  if (!nativeFetchAvailable()) return toast("秒讯登录只在 Android App 内可用（网页版没有本机桥）", 4600);
+  const email = (prompt("秒讯账号邮箱", aixhubEmail() || "") || "").trim().toLowerCase();
+  if (!email) return;
+  toast("正在发送验证码…", 1800);
+  const s = await aixhubBridge("aixhubSend", [email]);
+  if (!s.ok) return toast(s.message || "验证码发送失败", 5200);
+  const code = (prompt("验证码已发到 " + email + "（10 分钟内有效）", "") || "").trim();
+  if (!code) return;
+  const r = await aixhubBridge("aixhubLogin", [email, code]);
+  if (!r.ok || !r.token) return toast(r.message || "登录失败", 5200);
+  try {
+    localStorage.setItem(AIX_LS.token, r.token);
+    localStorage.setItem(AIX_LS.email, email);
+    localStorage.removeItem(AIX_LS.at);
+  } catch (e) { }
+  renderAixhub();
+  toast("秒讯已登录，下一轮抓取会用它的数据", 4200);
+  try { setTimeout(() => nativeFetchAll(true), 300); } catch (e) { }
+}
+function aixhubLogout() {
+  try {
+    localStorage.removeItem(AIX_LS.token);
+    localStorage.removeItem(AIX_LS.at);
+  } catch (e) { }
+  renderAixhub();
+  toast("已退出秒讯，只走官网 + 中国理财网");
+}
+function renderAixhub() {
+  const box = $("aixhubBox"); if (!box) return;
+  const on = !!aixhubToken();
+  box.innerHTML = `
+    <div class="note ${on ? "g" : ""}">${on
+      ? `已登录：<b>${esc(aixhubEmail() || "秒讯账号")}</b><br>只有你点<b>「⚡ 立即抓取」</b>时才查一次秒讯（3 分钟内不重复），
+         后台自动轮询不碰它；同一天以官网数值为准。`
+      : `可选。秒讯（第三方监控站）的代销净值比官网快，但它要登录后才能读 ——
+         登录后点「⚡ 立即抓取」会顺带查它一次，抢在官网更新前把最新一天补上。<br>
+         <b>没登录也能用</b>：只走官网 + 中国理财网。`}</div>
+    <div class="row-btn" style="margin-top:10px">
+      <button class="btn ${on ? "gh" : "pri"}" style="flex:1" onclick="aixhubLoginFlow()">${on ? "重新登录" : "秒讯登录"}</button>
+      ${on ? `<button class="btn gh" style="flex:1" onclick="aixhubLogout()">退出秒讯</button>` : ""}
+    </div>`;
+}
+function nativeFetchAvailable() {
+  try { return !!(window.NativeNav && window.NativeNav.ready && window.NativeNav.ready()); }
+  catch (e) { return false; }
+}
+window.__navDone = function (id, res) {
+  const f = _navDone[id]; if (!f) return;
+  delete _navDone[id]; f(res);
+};
+function nativeNavFetch(p, withAixhub) {
+  return new Promise(resolve => {
+    const id = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    let settled = false;
+    const finish = r => { if (settled) return; settled = true; delete _navDone[id]; resolve(r); };
+    const timer = setTimeout(() => finish({ ok: false, error: "本机抓取超时（90 秒）" }), 90000);
+    _navDone[id] = r => { clearTimeout(timer); finish(r); };
+    try {
+      window.NativeNav.fetch(id, JSON.stringify({
+        prodCode: prodCodeOf(p),
+        regCode: String(p.regCode || p.code || "").trim(),
+        name: String(p.name || ""),
+        inst: String(p.inst || ""),
+        navHistory: p.navHistory || {},
+        aixhubToken: withAixhub ? aixhubToken() : ""
+      }));
+    } catch (e) { clearTimeout(timer); finish({ ok: false, error: String(e) }); }
+  });
+}
+async function nativeFetchAll(forceAixhub) {
+  if (_nativeBusy) return;
+  /* 本机抓取不依赖 GitHub：没配同步也能抓、能落盘；配了才会在抓到新净值后自动推送 */
+  const list = DATA.products.filter(p => fetchStatus(p).ok);
+  if (!list.length) { toast("没有可抓取的产品：请先在产品页补填产品代码或登记编码"); return; }
+  /* 秒讯只在你手动点「⚡ 立即抓取」时查（3 分钟内不重复）：
+     它的接口要登录态，后台定时轮询既没必要、也容易被风控；官网那条线照旧自动跑。 */
+  const aixOn = !!aixhubToken();
+  let lastAix = 0;
+  try { lastAix = Number(localStorage.getItem(AIX_LS.at) || 0); } catch (e) { }
+  const withAixhub = aixOn && !!forceAixhub && Date.now() - lastAix > 3 * 60000;
+  if (aixOn && forceAixhub && !withAixhub) {
+    toast("秒讯 3 分钟内刚查过，这次只抓官网（不影响结果）", 3000);
+  }
+  if (withAixhub) { try { localStorage.setItem(AIX_LS.at, String(Date.now())); } catch (e) { } }
+  let aixErr = "";
+  _nativeBusy = true;
+  try { localStorage.setItem("licai.nativeFetchAt", String(Date.now())); } catch (e) { }
+  const t0 = Date.now();
+  MANUAL = { state: "running", t0, native: true, total: list.length, done: 0, added: 0, fail: 0 };
+  saveManual(); renderManBox();
+  const btn = $("btnFetchNow");
+  if (btn) { btn.disabled = true; btn.textContent = "本机抓取中…"; }
+
+  let added = 0, fail = 0, last = "";
+  const fails = [], srcMap = {}, fetchedNavs = {};
+  const runOne = async p => {
+    /* 已经有今天的净值就没必要再问秒讯，进一步减少请求 */
+    const l0 = latestNav(p);
+    const wantAix = withAixhub && (!l0 || l0[0] < today());
+    const r = await nativeNavFetch(p, wantAix);
+    MANUAL.done = (MANUAL.done || 0) + 1;
+    if (r && r.sources) {
+      for (const s of r.sources) {
+        if (s.src === "aixhub" && s.error) aixErr = s.error;
+      }
+    }
+    if (r && r.ok) {
+      /* 抓取是异步的：期间 syncPull 可能已经把 DATA 整体换成云端对象，
+         这里按 id 重新定位，避免把新净值写进已被替换掉的旧对象而丢失 */
+      const p2 = DATA.products.find(x => x.id === p.id) || p;
+      const navs = r.navs || {}, n = Object.keys(navs).length;
+      if (n) {
+        fetchedNavs[p.id] = Object.assign(fetchedNavs[p.id] || {}, navs);
+        p2.navHistory = p2.navHistory || {};
+        Object.assign(p2.navHistory, navs);
+        if (r.meta) for (const k in r.meta) if (!p2[k] && r.meta[k]) p2[k] = r.meta[k];
+        added += n;
+        saveLocal(); renderHome(); renderProd();
+      }
+      if (r.latest) {
+        last = r.latest;
+        /* 逐源明细（官网 / 中国理财网各自的披露日期）：产品详情页「最新净值取自…」读这里 */
+        srcMap[p.id] = {
+          latest: r.latest, via: r.via || "官网", label: r.label || "",
+          why: r.why || "", sources: r.sources || [], conflicts: r.conflicts || []
+        };
+      }
+    } else {
+      fail++;
+      fails.push(prodLabel(p) + "：" + ((r && r.error) || "未知错误"));
+    }
+    MANUAL.added = added; MANUAL.fail = fail;
+    saveManual(); renderManBox();
+  };
+  try {
+    let i = 0;
+    /* 并发 2：兼顾速度与目标站风控（中国理财网对同 IP 连续请求较敏感） */
+    const workers = Array.from({ length: Math.min(2, list.length) }, async () => {
+      while (i < list.length) { const p = list[i++]; await runOne(p); }
+    });
+    await Promise.all(workers);
+    /* 收尾再合并一次：若抓取期间 syncPull 把 DATA 整体换成了云端对象，
+       前面写进旧对象的增量会消失；这里按 id 补回当前对象（只补缺失日期，不重复计数） */
+    let lateAdded = 0;
+    for (const p of DATA.products) {
+      const add = fetchedNavs[p.id];
+      if (!add) continue;
+      p.navHistory = p.navHistory || {};
+      for (const d in add) if (!(d in p.navHistory)) { p.navHistory[d] = add[d]; lateAdded++; }
+    }
+    if (lateAdded) { added += lateAdded; saveLocal(); renderHome(); renderProd(); }
+    MANUAL.state = (added === 0 && fail === list.length) ? "fail" : "ok";
+    MANUAL.dur = Date.now() - t0;
+    MANUAL.navTime = last || stampOf(Date.now());
+    MANUAL.msg = fails.slice(0, 3).join("；");
+    saveManual(); renderManBox();
+    /* 本机抓取也写一份与云端相同结构的 lastFetch：
+       告警条、产品详情里的「最新净值取自…」、上次抓取时间都复用云端那套展示，
+       不新增界面。没有新增净值时不标脏，避免每 3 分钟白推一次 GitHub。 */
+    DATA.settings = DATA.settings || {};
+    DATA.settings.lastFetch = {
+      time: stampOf(Date.now()), source: "app", total: list.length,
+      ok: list.length - fail, fail: fail, items: fails.slice(0, 8),
+      sig: fails.map(s => s.slice(0, 40)).join("|"), products: srcMap
+    };
+    if (added) saveLocal();
+    else { try { localStorage.setItem(LS_DATA, JSON.stringify(DATA)); } catch (e) { } }
+    renderAlert();
+    if (added) autoPush();
+    toast(added ? `本机抓取完成：新增 ${added} 条净值` + (fail ? `，${fail} 只失败` : "")
+                : `本机抓取完成：暂无新净值` + (fail ? `（${fail} 只失败）` : ""), 4200);
+    if (aixErr && withAixhub) {
+      const dead = /401|登录|token|unauthor/i.test(aixErr);
+      toast(dead ? "秒讯登录已失效，请到「设置 → 秒讯」重新登录（不影响官网抓取）"
+                 : "秒讯这次没取到：" + aixErr.slice(0, 60), 6000);
+      if (dead) { try { localStorage.removeItem(AIX_LS.at); } catch (e) { } }
+    }
+  } finally {
+    _nativeBusy = false;
+    if (btn) { btn.disabled = false; btn.textContent = "⚡ 立即抓取"; }
+  }
+}
+/* App 启动 / 回到前台 / 页面可见时调用。节流按「有没有追上昨天」自适应：
+   全部产品都已披露到昨天 → 30 分钟一次；只要有一只还落后 → 3 分钟一次。
+   公开披露一更新就能在几分钟内落库，不必等用户手动点「立即抓取」。
+   force=true 用于启动/升级后的首次抓取，只留 60 秒防抖。 */
+window.__nativeAutoFetch = function (force) {
+  if (!nativeFetchAvailable()) return;
+  if (!DATA.products || !DATA.products.length) return;
+  if (_nativeBusy) return;
+  const now = Date.now();
+  const last = Number(localStorage.getItem("licai.nativeFetchAt") || 0);
+  const y = stampOf(now - 86400000).slice(0, 10);
+  let behind = false;
+  for (const p of DATA.products) {
+    if (!fetchStatus(p).ok) continue;
+    const l = latestNav(p);
+    if (!l || l[0] < y) { behind = true; break; }
+  }
+  const wait = force ? 60000 : (behind ? 3 * 60000 : 30 * 60000);
+  if (now - last < wait) return;
+  nativeFetchAll();
+};
 function syncMsg(html) { const e = $("syncMsg"); if (e) e.innerHTML = html; else toast(html.replace(/<[^>]+>/g, "")); }
 async function testConn() {
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) return toast("请先填完整配置");
@@ -2630,7 +2732,7 @@ function renderAlert() {
   const more = n > 3 ? `<div class="sm">…另有 ${n - 3} 只，点「详情」看全部</div>` : "";
   bar.className = "alert warn show";
   bar.innerHTML = `<div class="tx">
-      <b>云端抓取有 ${n} 只产品没拿到净值</b>${lf.time ? `<span class="sm"> · ${esc(lf.time)}</span>` : ""}
+      <b>${lf.source === "app" ? "本机抓取" : "云端抓取"}有 ${n} 只产品没拿到净值</b>${lf.time ? `<span class="sm"> · ${esc(lf.time)}</span>` : ""}
       ${items}${more}
       <div style="margin-top:4px"><span class="more" onclick="refreshNav()">详情与处理办法 ›</span></div>
     </div>
@@ -2723,6 +2825,22 @@ function clearAll() {
 /* ============================================================
    启动
    ============================================================ */
+
+/* ---------- 内联事件桥 ----------
+   ES module 的顶层函数不再自动成为 window 属性，而 index.html 与各渲染函数里
+   的内联 onclick/oninput 仍按全局查找。这里显式把入口挂回 window。
+   ⚠️ 新增内联 handler 时必须同步加进这个清单 ——
+   tests/handlers.test.mjs 会扫描 index.html / app.js 里的内联调用做双向校验。 */
+Object.assign(window, {
+  addNav, aixhubLoginFlow, aixhubLogout, autoFillNav, bulkNav, calcShares, calMove, clearAll,
+  clearDetSearch, closeSheet, commitNav, delNav, delProd, delTrade, dismissAlert, editProd,
+  exportJSON, go, importJSON, ocrPick, ocrShot, onDetSearch, onProdCodeInput, openLinkAdd,
+  openNav, openProd, openProdDetail, openSync, openTrade, pickDay, pickProduct, previewLink,
+  queryProduct, refreshNav, renderPick, renderTradeForm2, resetManualFetch, saveFromLink,
+  saveProduct, saveSyncCfg, saveTrade, setDetInst, setDetSort, setDetTab, setGroup, setProdOv,
+  setProdRange, setRange, syncPull, syncPush, toggleHide, toggleNotify, triggerFetch
+});
+
 (function init() {
   loadLocal();
   loadNotify();
@@ -2734,8 +2852,24 @@ function clearAll() {
   if (migrated) notifyMigrate();
   /* 上次手动抓取若在系统回收时还没跑完，启动后接着追踪（12 分钟上限自动兜底） */
   ensureManualPolling();
-  if (SYNC.owner && SYNC.repo && SYNC.token) syncPull(false);
-  window.addEventListener("online", () => { if (SYNC.owner) syncPull(false); });
+  const pullP = (SYNC.owner && SYNC.repo && SYNC.token) ? syncPull(false) : Promise.resolve();
+  window.addEventListener("online", () => {
+    if (SYNC.owner) syncPull(false);
+    if (nativeFetchAvailable()) { try { window.__nativeAutoFetch(); } catch (e) { } }
+  });
+  /* App 内：必须等云端数据到位再抓 —— 首次安装时本地还没有产品，
+     固定 1.2 秒的定时器会扑空，表现成「装完一直没净值」。最多等 6 秒。 */
+  if (nativeFetchAvailable()) {
+    Promise.race([pullP, new Promise(r => setTimeout(r, 6000))])
+      .then(() => setTimeout(() => { try { window.__nativeAutoFetch(true); } catch (e) { } }, 600));
+    /* 页面在前台时按自适应节流反复核对（落后时 3 分钟一次），
+       公开源一披露就自动落库，不用一直盯着点「立即抓取」 */
+    setInterval(() => {
+      if (document.visibilityState === "visible") {
+        try { window.__nativeAutoFetch(); } catch (e) { }
+      }
+    }, 2 * 60000);
+  }
 
   /* 提醒的两条触发路径（详见「提醒」章节的说明）：
      ① 页面在后台时每 60 分钟比对一次云端版本，有新净值就发系统通知；
@@ -2744,6 +2878,8 @@ function clearAll() {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       checkCloudUpdate(); renderAlert(); renderNotify();
+      /* App 回到前台：立刻按节流核对一次净值（切后台期间可能正好披露了新一天） */
+      if (nativeFetchAvailable()) { try { window.__nativeAutoFetch(); } catch (e) { } }
     }
   });
   /* 注册 Service Worker（仅 https / localhost 生效，file:// 下自动跳过）
@@ -2752,7 +2888,9 @@ function clearAll() {
      所以这里主动监听更新：updatefound 只在真的发现新版本时触发，
      新 SW 一装好（installed）且当前有旧 SW 在控制页面，就提示并自动刷新一次
      （sessionStorage 里记一下，确保每个版本最多刷一次，杜绝循环刷新）。 */
-  if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  /* App 内置版本不注册 SW：APK 已把静态资源打包，SW 只会在升级后继续喂旧壳。
+     （页面由 WebViewAssetLoader 以 https 提供，不拦的话 SW 会真的装上。） */
+  if (!nativeFetchAvailable() && "serviceWorker" in navigator && location.protocol !== "file:") {
     const FLAG = "licai_sw_reloaded";
     const reloadOnce = () => {
       try {
