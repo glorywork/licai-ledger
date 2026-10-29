@@ -31,7 +31,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v37";
+const APP_VER = "v38";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -945,15 +945,19 @@ function saveTrade() {
   const navDate = $("tNavDate").value || tradeDate;
   let nav = Number($("tNav").value) || 0;
   if (nav <= 0) return toast("请填写有效的确认净值");
-  /* 净值历史保护：该日期若已有净值，以已披露净值为准（防止交易录入覆盖真实净值）。
-     若没有，则把本次填写值补进历史，便于后续计算。 */
+  /* 净值历史只存「官方披露」的值：
+     ① 该日期已有净值 → 以已披露值为准（防止交易录入覆盖真实净值）；
+     ② 该日期还没有净值 → 不写入。交易自己的确认净值已存在 confirmNav 里，
+        份额/成本计算只读它，不需要污染净值曲线。
+     曾经的写法是「没有就补进去」，后果很隐蔽：买入当天会在披露日之前凭空多出
+     一条「当日净值」，万份收益/近 7 日年化据此算出假信号，而且官网后来补出
+     真值也会被「已有净值不覆盖」挡住，永远改不回来。 */
   if (!p.navHistory) p.navHistory = {};
   const existing = p.navHistory[navDate];
-  let warned = false;
+  let warned = false, navDisclosed = false;
   if (existing !== undefined && existing !== null && existing !== "") {
+    navDisclosed = true;
     if (Math.abs(Number(existing) - nav) > 1e-9) { nav = Number(existing); warned = true; }
-  } else {
-    p.navHistory[navDate] = nav;
   }
   let t = { id: uid(), prodId: p.id, type, tradeDate, confirmDate, confirmNavDate: navDate, confirmNav: nav, createdAt: Date.now() };
   if (type === "buy") {
@@ -971,7 +975,10 @@ function saveTrade() {
   }
   DATA.trades.push(t);
   saveLocal(); closeSheet();
-  toast(warned ? `已保存。${navDate} 按已披露净值 ${nav.toFixed(4)} 计算` : "交易已保存", warned ? 3200 : 2000);
+  toast(warned ? `已保存。${navDate} 按已披露净值 ${nav.toFixed(4)} 计算`
+    : navDisclosed ? "交易已保存"
+      : `交易已保存。${navDate} 官网还没披露净值，按你填的 ${nav.toFixed(4)} 记入交易（不进净值曲线）`,
+  navDisclosed ? (warned ? 3200 : 2000) : 4200);
   renderHome(); renderTrade(); renderProd(); autoPush();
 }
 
@@ -989,7 +996,7 @@ function prodForm(pid) {
     <div class="note b" style="margin-bottom:12px">
       净值由云端自动抓取，需要两个代码配合：<br>
       ① <b>产品登记编码</b>（Z / C 开头）— 中国理财网信披平台查询用；<br>
-      ② <b>产品代码</b> — 云端抓净值的依据（北银如 <code>YJ01251204A</code>，华夏如 <code>208212400701</code>，信银如 <code>AF251387C</code>，南银如 <code>NYYW000016</code>，民生如 <code>FBAG65601C</code>）。信银要填<b>完整的份额代码</b>（含末位份额字母），去掉末位字母查不到。
+      ② <b>产品代码</b> — 云端抓净值的依据（北银如 <code>YJ01251204A</code>，华夏如 <code>208212400701</code>，信银如 <code>AF251387C</code>，南银如 <code>NYYW000016</code>，民生如 <code>FBAG65601C</code>，徽银如 <code>PNHY260395A</code>）。信银要填<b>完整的份额代码</b>（含末位份额字母），去掉末位字母查不到；徽银同理，漏了字母只能按前缀猜，多个份额时会要求补全。
     </div>
     <div class="field"><label>① 产品登记编码</label>
       <div class="actin"><input id="pCode" placeholder="如 Z7008926000006" value="${esc(p && p.code || "")}"><button class="btn pri" onclick="queryProduct()">查询</button></div>
