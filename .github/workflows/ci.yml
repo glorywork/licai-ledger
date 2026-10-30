@@ -26,6 +26,10 @@ jobs:
       - name: 版本与资源一致性
         run: bash scripts/check-version.sh
 
+      # 当年节假日必须已配置：未配置时确认日会静默按周一至周五估算
+      - name: 交易日历门禁
+        run: node scripts/check-calendar.mjs
+
       - name: 语法检查
         run: |
           node --check app.js
@@ -40,4 +44,4 @@ jobs:
 
       # T+1 确认口径、净值序列、机构识别、截图 OCR 配对、内联事件桥契约
       - name: 纯逻辑测试
-        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs
+        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs tests/calendar.test.mjs tests/tomb.test.mjs

@@ -18,6 +18,8 @@ import { navSeries, navAt, navOnOrBefore, latestNav, navHit } from "./js/domain/
 import { sharesOn as sharesOnWith, hasAnyTrade as hasAnyTradeIn,
   computePosition } from "./js/domain/position.js";
 import { ocrNavLines } from "./js/domain/ocr.js";
+import { configureCalendar, suggestTradeDates, tradeDaysBetween } from "./js/domain/calendar.js";
+import { normTomb, mergeTombs, purgeTombs, applyTombs as applyTombsIn } from "./js/domain/tomb.js";
 
 /* ---------- 常量 ---------- */
 const LS_DATA = "licai_ledger_v1";
@@ -31,7 +33,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v38";
+const APP_VER = "v40";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -134,6 +136,37 @@ function saveSync() {
 }
 
 /* ============================================================
+   删除墓碑（防止「删掉的东西被另一台设备推回来」）
+   ------------------------------------------------------------
+   同步是整文件 PUT。另一台设备如果还拿着删除前的快照，它的一次推送就会把
+   已删产品/交易原样写回；syncPush 的「云端独有净值并入」也会把刚删的那天
+   净值补回来。墓碑记 { kind: { key: 删除时间戳 } }，随 payload 上传；
+   每次推送前先并合云端墓碑并执行删除，30 天后自动过期 ——
+   过期是为了让官网以后真正补发的同日期净值仍能被正常接收。
+   纯逻辑在 js/domain/tomb.js，这里只保留与 DATA 打交道的薄壳。 */
+const TOMB_DAYS = 30;
+
+function tombstones() {
+  DATA.tomb = normTomb(DATA.tomb);
+  return DATA.tomb;
+}
+/** @param {"products"|"trades"|"navs"} kind @param {string} key */
+function tombAdd(kind, key) { tombstones()[kind][key] = Date.now(); }
+
+/** 清理过期墓碑，返回清理条数 */
+function tombPurge() { return purgeTombs(tombstones(), Date.now(), TOMB_DAYS); }
+
+/**
+ * 按墓碑删除数据（产品 / 交易 / 净值日期），返回删除条数。
+ * @param {any} d
+ */
+function applyTombs(d) {
+  if (!d) return 0;
+  d.tomb = normTomb(d.tomb);
+  return applyTombsIn(d, d.tomb);
+}
+
+/* ============================================================
    数据迁移与去重
    ------------------------------------------------------------
    背景（来自项目交接文档）：早期版本只有「销售代码」一栏，用户把云端抓
@@ -204,6 +237,14 @@ function absorbProduct(keep, drop) {
 }
 function migrateData() {
   let changed = false; const logs = [];
+  /* 0) 墓碑：清理过期的；执行仍有效的（别的设备删过的数据不在本机复活）。
+     放在最前面 —— 后面的「重复产品合并」不该把已删除的记录再算进来。 */
+  const purged = tombPurge();
+  const removed = applyTombs(DATA);
+  if (purged || removed) {
+    changed = true;
+    if (removed) logs.push(`按删除墓碑清理 ${removed} 条已被删除的数据`);
+  }
   /* 1) 销售代码 → 产品代码；旧字段一律清掉（含历史遗留的空串） */
   for (const p of DATA.products) {
     if (p.shareCode === undefined) continue;
@@ -259,6 +300,23 @@ function notifyMigrate() {
    保留这层薄壳，日历/区间收益/明细等 40+ 处调用点不用逐个改参数。 */
 function sharesOn(p, date) { return sharesOnWith(p, DATA.trades, date); }
 function hasAnyTrade(p) { return hasAnyTradeIn(p, DATA.trades); }
+
+/* 日历以代码内置数据为准，云端 settings.tradeCal 可以补年 / 改截止时间：
+   国务院一般 11 月才发下一年的安排，把新一年写进数据文件就不用重发 APK。
+   拉取、导入、启动后都重新合并一次（只增改，不会清掉内置年份）。 */
+function applyCalendarConfig() {
+  configureCalendar(DATA.settings && DATA.settings.tradeCal);
+}
+
+/* 净值滞后（按交易日）：最新净值日期之后又过了几个交易日。
+   ≥2 个交易日还没新净值才算「滞后」——披露当天与前一个交易日之间属于正常等待，
+   长假期间也不算（自然日口径会在国庆/春节误报一堆）。 */
+function navStaleInfo(p) {
+  const l = latestNav(p);
+  if (!l) return null;
+  const lag = tradeDaysBetween(l[0], today());
+  return lag >= 2 ? { lag, date: l[0] } : null;
+}
 
 /* 该日是否有任一产品披露了净值。
    用来区分「未披露」（无数据，不该显示成 0）与「收益为 0」（有净值但持平）。 */
@@ -774,10 +832,12 @@ function renderProd() {
       const pos = position(p);
       const l = latestNav(p);
       const st = fetchStatus(p);
+      const stale = navStaleInfo(p);
       return `<div class="pick" style="cursor:default">
         <div class="p1"><button class="link" onclick="openProdDetail('${p.id}')">${esc(prodLabel(p))}</button> <span class="wr" style="font-size:10.5px;color:var(--ink3)">${esc(p.inst || "")}</span></div>
         <div class="p2">登记编码 ${esc(p.code || "-")} · 产品代码 <b>${esc(p.prodCode || "-")}</b></div>
         <div class="p2" style="color:${st.ok ? "#0d7a52" : "#8a6300"}">${st.txt}</div>
+        ${stale ? `<div class="p2" style="color:#8a6300">⏳ 净值停在 ${esc(stale.date)}，此后已过 ${stale.lag} 个交易日未更新</div>` : ""}
         <div class="p3">份额 ${pos.shares.toFixed(2)} · 成本 ${money(pos.cost)} · 市值 ${money(pos.market)} · 浮盈 <b class="${cls(pos.profit)}">${signMoney(pos.profit)}</b> · 净值 ${l ? l[1].toFixed(4) + " (" + l[0] + ")" : "无数据"}</div>
         <div class="row-btn" style="margin-top:8px">
           <button class="mini" onclick="openProdDetail('${p.id}')">详情</button>
@@ -810,6 +870,7 @@ function renderSet() {
     : `<div class="note">尚未连接云端。配置后即可多设备共享同一份台账数据。</div>`;
   $("syncState").textContent = ok ? "已连接" : "未连接";
   renderAixhub();
+  renderLedgerme();
   renderNotify();
 }
 
@@ -880,8 +941,13 @@ function renderTradeForm() {
   const p = DATA.products.find(x => x.id === UI.activePick);
   if (!p) { $("tFormBox").innerHTML = ""; return; }
   const t = today();
-  const lastNav = latestNav(p);
-  const defNav = lastNav ? lastNav[1] : "";
+  /* 确认日不再默认「今天」：按交易日历（周末 / 法定假日 / 调休）推算 T+1。
+     15:00 截止之后提交、或交易日本身休市，受理日会顺延 —— 这些都由纯函数
+     js/domain/calendar.js 计算，界面上把推算结果写出来，允许用户手动改。 */
+  const sug = suggestTradeDates(t, new Date(), detectOrg(p));
+  const hitNav = navHit(p, sug.navDate);
+  const defNavDate = hitNav ? hitNav[0] : sug.navDate;
+  const defNav = hitNav ? Number(hitNav[1]).toFixed(4) : "";
   $("tFormBox").innerHTML = `
     <div class="note b">当前操作产品：<b>${esc(prodLabel(p))}</b><br>${esc(p.inst || "")}${p.prodCode ? " · 产品代码 " + esc(p.prodCode) : ""}</div>
     <div class="field" style="margin-top:12px"><label>交易类型</label>
@@ -890,18 +956,44 @@ function renderTradeForm() {
       </select>
     </div>
     <div class="field"><label>交易日期</label>
-      <div class="actin"><input type="date" id="tDate" value="${t}"><button class="mini" onclick="document.getElementById('tDate').value=''">清空</button></div>
+      <div class="actin"><input type="date" id="tDate" value="${t}" onchange="onTradeDateChange()"><button class="mini" onclick="document.getElementById('tDate').value=''">清空</button></div>
     </div>
-    <div class="field"><label>交易确认日期</label><div class="actin"><input type="date" id="tConfirm" value="${t}"></div></div>
+    <div class="field"><label>交易确认日期</label><div class="actin"><input type="date" id="tConfirm" value="${sug.confirmDate}"></div><div id="tCalTip" class="tip"></div></div>
     <div id="tTypeBox"></div>
-    <div class="field"><label>确认净值日期</label><input type="date" id="tNavDate" value="${lastNav ? lastNav[0] : t}" onchange="autoFillNav()"></div>
+    <div class="field"><label>确认净值日期</label><input type="date" id="tNavDate" value="${defNavDate}" onchange="autoFillNav()"></div>
     <div class="field"><label>确认净值</label><input type="number" step="0.0001" id="tNav" value="${defNav}" placeholder="留空则自动取该日净值" oninput="calcShares()"></div>
     <div id="tShareBox"></div>
     <div class="row-btn" style="margin-top:14px">
       <button class="btn gh" style="flex:1" onclick="closeSheet()">取消</button>
       <button class="btn pri" style="flex:1" onclick="saveTrade()">保存交易</button>
     </div>`;
+  renderCalTip(sug);
   renderTradeForm2();
+}
+/* 交易日期改动 → 重算确认日与确认净值日期（都可再手动改） */
+function onTradeDateChange() {
+  const p = DATA.products.find(x => x.id === UI.activePick);
+  const d = $("tDate") ? $("tDate").value : "";
+  if (!p || !d) return;
+  const sug = suggestTradeDates(d, new Date(), detectOrg(p));
+  if ($("tConfirm")) $("tConfirm").value = sug.confirmDate;
+  /* 净值取「受理日当天，没有就向前取最近」：补录历史交易时不会错拿最新的净值 */
+  const hit = navHit(p, sug.navDate);
+  if ($("tNavDate")) $("tNavDate").value = hit ? hit[0] : sug.navDate;
+  if ($("tNav")) $("tNav").value = hit ? Number(hit[1]).toFixed(4) : "";
+  renderCalTip(sug);
+  calcShares();
+}
+/* 推算说明：把「为什么是这个确认日」讲清楚，避免用户误以为系统乱改 */
+function renderCalTip(sug) {
+  const el = $("tCalTip");
+  if (!el || !sug) return;
+  const why = [];
+  if (sug.deferred) why.push("已过当日截止时间，按下一交易日受理");
+  else if (sug.rolled) why.push("原日期休市，已顺延");
+  if (sug.unknownYears.length) why.push(`${sug.unknownYears.join("/")} 年节假日未配置，按周一至周五估算`);
+  el.textContent = `按交易日历推算：${sug.applyDate} 受理 → 确认日 ${sug.confirmDate}`
+    + (why.length ? `（${why.join("；")}）` : "") + "，可手动修改。";
 }
 function renderTradeForm2() {
   const type = $("tType").value;
@@ -1533,6 +1625,7 @@ function renderProdDetail() {
   const wan = lastNum(st.wan), a7 = lastNum(st.a7), a14 = lastNum(st.a14), a30 = lastNum(st.a30);
   const since = sinceAnnual(st);
   const src = navSrcInfo(p);                 /* 上次抓取的双源比对结果（官网 vs 中国理财网） */
+  const stale = navStaleInfo(p);             /* 按交易日算的滞后（≥2 个交易日才提示） */
   const navFmt = v => (v === null ? "—" : Number(v).toFixed(4));
   const pctFmt = v => (v === null ? "—" : `${v >= 0 ? "+" : ""}${pct(v)}`);
 
@@ -1585,11 +1678,13 @@ function renderProdDetail() {
       <div class="stat"><div class="l">成立以来年化</div><div class="v ${cls(since === null ? 0 : since)}">${pctFmt(since)}</div><div class="cap">首末净值折算 · 全周期</div></div>
     </div>
     <div class="cap" style="padding:6px 0 0">样本不足时显示「—」，不估算、不补齐；净值型产品官方不披露万份收益与年化，以上均为本工具折算口径。</div>
-    ${(latestDate && nativeFetchAvailable() && (Date.now() - parseDate(latestDate).getTime()) > 36 * 3600000)
-      ? `<div class="tip" style="margin-top:6px">⏳ 公开渠道最新到 <b>${esc(latestDate)}</b>。${aixhubToken()
+    ${stale && nativeFetchAvailable()
+      ? `<div class="tip" style="margin-top:6px">⏳ 公开渠道最新到 <b>${esc(stale.date)}</b>，此后已过 <b>${stale.lag}</b> 个交易日。${aixhubToken()
           ? `已登录<b>秒讯</b>：点「⚡ 立即抓取」会用它的数据（通常早上就有）；北银官网在开放日次日 11:00–15:00 才上传。`
           : `北银官网在开放日次日 11:00–15:00 上传净值（汇总表与公告表两张表都会查），App 在前台时每 3 分钟自动核对，上传后几分钟内就会补上。想在早上就看到，可到「设置 → 秒讯」登录（可选）。`}</div>`
-      : ""}
+      : stale
+        ? `<div class="tip" style="margin-top:6px">⏳ 最新净值停在 <b>${esc(stale.date)}</b>，此后已过 <b>${stale.lag}</b> 个交易日。云端每个交易日都会抓；若持续不更新，先核对产品代码与发行机构是否正确。</div>`
+        : ""}
 
     ${pos.shares > 0 ? `<div class="card-t" style="margin:14px 0 8px"><h2 style="font-size:14px">我的持仓</h2></div>
     <div class="grid2">
@@ -1912,6 +2007,9 @@ function commitNav(pid) {
   for (const r of doRows) {
     if (r.status === "exist") cov++; else add++;
     p.navHistory[r.date] = r.nav;          /* r.nav 已在解析阶段校验为「正的有限数」 */
+    /* 手工重新写入 = 有意恢复这一天：撤掉对应墓碑，
+       否则推送前执行墓碑时会把刚恢复的净值又删掉。 */
+    if (DATA.tomb && DATA.tomb.navs) delete DATA.tomb.navs[pid + "|" + r.date];
   }
   /* 未识别的行留在草稿里 —— 别让用户回原文里再挑一遍 */
   const left = st.rows.filter(r => r.status === "bad").map(r => r.raw).join("\n");
@@ -1923,17 +2021,26 @@ function commitNav(pid) {
     + (left ? `，${st.counts.bad} 行未识别已留在框里` : ""), 3400);
 }
 function delNav(pid, d) {
-  const p = DATA.products.find(x => x.id === pid); delete p.navHistory[d];
+  const p = DATA.products.find(x => x.id === pid);
+  if (!p || !p.navHistory || p.navHistory[d] === undefined) return;
+  /* 留墓碑：云端抓取或另一台设备的旧快照都可能把这天再写回来 */
+  tombAdd("navs", pid + "|" + d);
+  delete p.navHistory[d];
   saveLocal(); openNav(pid); renderHome(); renderProd(); autoPush();
 }
 function delProd(pid) {
   if (!confirm("删除该产品及其所有交易记录？")) return;
+  tombAdd("products", pid);
+  /* 交易也要逐个留墓碑：否则别的设备按旧快照推送时，产品没了、交易还在，
+     云端数据会变成「交易指向不存在的产品」（validate_data 直接报错）。 */
+  for (const t of DATA.trades) if (t.prodId === pid) tombAdd("trades", t.id);
   DATA.products = DATA.products.filter(x => x.id !== pid);
   DATA.trades = DATA.trades.filter(t => t.prodId !== pid);
   saveLocal(); renderProd(); renderHome(); autoPush();
 }
 function delTrade(tid) {
   if (!confirm("删除这笔交易？")) return;
+  tombAdd("trades", tid);
   DATA.trades = DATA.trades.filter(t => t.id !== tid);
   saveLocal(); renderTrade(); renderHome(); autoPush();
 }
@@ -2274,18 +2381,53 @@ async function triggerFetch() {
 const _navDone = {};
 let _nativeBusy = false;
 
-/* ---------- 秒讯（可选）：邮箱验证码登录，token 只存本机 ---------- */
-const AIX_LS = { token: "licai.aixhubToken", email: "licai.aixhubEmail", at: "licai.aixhubAt" };
+/* ---------- 秒讯 / 净值账本（可选）：登录态只存本机 ---------- */
+const AIX_LS = {
+  token: "licai.aixhubToken", email: "licai.aixhubEmail",
+  at: "licai.aixhubAt", lic: "licai.aixhubLic", chk: "licai.aixhubChk"
+};
+const LGM_LS = {
+  cookie: "licai.ledgermeCookie", user: "licai.ledgermeUser",
+  name: "licai.ledgermeName", at: "licai.ledgermeAt", chk: "licai.ledgermeChk"
+};
 const _aixDone = {};
-function aixhubToken() { try { return localStorage.getItem(AIX_LS.token) || ""; } catch (e) { return ""; } }
-function aixhubEmail() { try { return localStorage.getItem(AIX_LS.email) || ""; } catch (e) { return ""; } }
+let _aixChecking = false, _aixAutoTried = false;
+let _lgmChecking = false, _lgmAutoTried = false;
+function lsGet(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }
+function lsSet(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) { } }
+function lsDel(k) { try { localStorage.removeItem(k); } catch (e) { } }
+function aixhubToken() { return lsGet(AIX_LS.token); }
+function aixhubEmail() { return lsGet(AIX_LS.email); }
+function ledgermeCookie() { return lsGet(LGM_LS.cookie); }
+function ledgermeUser() { return lsGet(LGM_LS.user); }
+function ledgermeName() { return lsGet(LGM_LS.name); }
+function aixhubLic() {
+  try {
+    const o = JSON.parse(lsGet(AIX_LS.lic) || "null");
+    return o && typeof o === "object" ? o : null;
+  } catch (e) { return null; }
+}
+function aixhubLicInfo() {
+  const l = aixhubLic();
+  if (!l) return { known: false, expired: false, days: 0, until: "" };
+  let exp = Number(l.expires_at) || 0;
+  if (exp > 1e11) exp /= 1000;              /* 兼容毫秒；秒讯前端用的是秒 */
+  let days = Number(l.remaining_days);
+  if (exp) days = Math.max(0, Math.ceil((exp * 1000 - Date.now()) / 86400000));
+  else if (!Number.isFinite(days)) days = 0;
+  const expired = (l.state && l.state !== "active") || (exp > 0 && exp * 1000 <= Date.now());
+  return {
+    known: true, expired: !!expired, days: Math.max(0, days),
+    until: exp ? stampOf(exp * 1000).slice(0, 10) : "", state: l.state || ""
+  };
+}
 window.__aixDone = function (id, res) {
   const f = _aixDone[id]; if (!f) return;
   delete _aixDone[id]; f(res);
 };
-function aixhubBridge(method, args) {
+function aixhubBridge(method, args, label) {
   return new Promise(resolve => {
-    if (!nativeFetchAvailable()) return resolve({ ok: false, message: "秒讯登录只在 Android App 内可用" });
+    if (!nativeFetchAvailable()) return resolve({ ok: false, message: (label || "秒讯登录") + "只在 Android App 内可用" });
     const id = "a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const timer = setTimeout(() => { delete _aixDone[id]; resolve({ ok: false, message: "超时，请重试" }); }, 30000);
     _aixDone[id] = r => { clearTimeout(timer); resolve(r || { ok: false }); };
@@ -2293,6 +2435,38 @@ function aixhubBridge(method, args) {
     catch (e) { clearTimeout(timer); delete _aixDone[id]; resolve({ ok: false, message: String(e) }); }
   });
 }
+
+/* 秒讯：/api/me?compact=1 的 license 里有 expires_at（秒）/state。
+   以前只存 token，不看这个字段，所以只能等抓取撞 401 才知道失效。 */
+async function aixhubCheck(silent) {
+  const token = aixhubToken();
+  if (!token || !nativeFetchAvailable() || _aixChecking) return null;
+  _aixChecking = true;
+  const r = await aixhubBridge("aixhubMe", [token]);
+  _aixChecking = false;
+  if (r && r.ok) {
+    lsSet(AIX_LS.lic, JSON.stringify(r.license || {}));
+    lsSet(AIX_LS.chk, Date.now());
+    renderAixhub();
+    if (!silent) {
+      const li = aixhubLicInfo();
+      toast(li.expired
+        ? "秒讯会员已到期/状态异常；官网抓取不受影响"
+        : `秒讯登录有效${li.days ? "，会员剩余 " + li.days + " 天" : ""}`, 4200);
+    }
+    return r;
+  }
+  const msg = String((r && r.message) || "网络异常");
+  if (Number(r && r.status) === 401) {
+    lsDel(AIX_LS.token); lsDel(AIX_LS.lic); lsDel(AIX_LS.at);
+    renderAixhub();
+    if (!silent) toast("秒讯登录已失效，请重新登录（邮箱已记住）", 5200);
+  } else if (!silent) {
+    toast("秒讯状态检查失败：" + msg.slice(0, 90), 5200);
+  }
+  return null;
+}
+function aixhubCheckNow() { aixhubCheck(false); }
 async function aixhubLoginFlow() {
   if (!nativeFetchAvailable()) return toast("秒讯登录只在 Android App 内可用（网页版没有本机桥）", 4600);
   const email = (prompt("秒讯账号邮箱", aixhubEmail() || "") || "").trim().toLowerCase();
@@ -2304,37 +2478,127 @@ async function aixhubLoginFlow() {
   if (!code) return;
   const r = await aixhubBridge("aixhubLogin", [email, code]);
   if (!r.ok || !r.token) return toast(r.message || "登录失败", 5200);
-  try {
-    localStorage.setItem(AIX_LS.token, r.token);
-    localStorage.setItem(AIX_LS.email, email);
-    localStorage.removeItem(AIX_LS.at);
-  } catch (e) { }
+  lsSet(AIX_LS.token, r.token);
+  lsSet(AIX_LS.email, email);
+  lsDel(AIX_LS.at);
   renderAixhub();
-  toast("秒讯已登录，下一轮抓取会用它的数据", 4200);
+  /* 登录后立刻读一次 license：把“还剩几天/是否已到期”显示出来 */
+  const me = await aixhubBridge("aixhubMe", [r.token]);
+  if (me && me.ok) { lsSet(AIX_LS.lic, JSON.stringify(me.license || {})); lsSet(AIX_LS.chk, Date.now()); }
+  renderAixhub();
+  const li = aixhubLicInfo();
+  toast(me && me.ok && !li.expired
+    ? `秒讯已登录${li.days ? "，会员剩余 " + li.days + " 天" : ""}，下一轮抓取会用它的数据`
+    : "秒讯已登录，下一轮抓取会用它的数据", 4600);
   try { setTimeout(() => nativeFetchAll(true), 300); } catch (e) { }
 }
 function aixhubLogout() {
-  try {
-    localStorage.removeItem(AIX_LS.token);
-    localStorage.removeItem(AIX_LS.at);
-  } catch (e) { }
+  lsDel(AIX_LS.token); lsDel(AIX_LS.at); lsDel(AIX_LS.lic); lsDel(AIX_LS.chk);
   renderAixhub();
   toast("已退出秒讯，只走官网 + 中国理财网");
 }
 function renderAixhub() {
   const box = $("aixhubBox"); if (!box) return;
   const on = !!aixhubToken();
+  const li = aixhubLicInfo();
+  let status = "";
+  if (on) {
+    if (li.known) {
+      status = li.expired
+        ? `<br><span style="color:var(--up)">会员已到期/状态异常${li.until ? "（到期日 " + li.until + "）" : ""}</span>`
+        : `<br>会员剩余 <b>${li.days}</b> 天${li.until ? "（至 " + li.until + "）" : ""}`;
+    } else {
+      status = `<br>登录状态待检查`;
+    }
+  }
   box.innerHTML = `
-    <div class="note ${on ? "g" : ""}">${on
-      ? `已登录：<b>${esc(aixhubEmail() || "秒讯账号")}</b><br>只有你点<b>「⚡ 立即抓取」</b>时才查一次秒讯（3 分钟内不重复），
+    <div class="note ${on && !li.expired ? "g" : ""}">${on
+      ? `已登录：<b>${esc(aixhubEmail() || "秒讯账号")}</b>${status}<br>
+         只有你点<b>「⚡ 立即抓取」</b>时才查一次秒讯（3 分钟内不重复），
          后台自动轮询不碰它；同一天以官网数值为准。`
       : `可选。秒讯（第三方监控站）的代销净值比官网快，但它要登录后才能读 ——
          登录后点「⚡ 立即抓取」会顺带查它一次，抢在官网更新前把最新一天补上。<br>
          <b>没登录也能用</b>：只走官网 + 中国理财网。`}</div>
-    <div class="row-btn" style="margin-top:10px">
-      <button class="btn ${on ? "gh" : "pri"}" style="flex:1" onclick="aixhubLoginFlow()">${on ? "重新登录" : "秒讯登录"}</button>
-      ${on ? `<button class="btn gh" style="flex:1" onclick="aixhubLogout()">退出秒讯</button>` : ""}
+    <div class="row-btn" style="margin-top:10px;flex-wrap:wrap">
+      <button class="btn ${on ? "gh" : "pri"}" style="flex:1 1 45%" onclick="aixhubLoginFlow()">${on ? "重新登录" : "秒讯登录"}</button>
+      ${on ? `<button class="btn gh" style="flex:1 1 45%" onclick="aixhubCheckNow()">检查状态</button>` : ""}
+      ${on ? `<button class="btn gh" style="flex:1 1 45%" onclick="aixhubLogout()">退出秒讯</button>` : ""}
     </div>`;
+  if (on && !_aixAutoTried) {
+    _aixAutoTried = true;
+    let chk = 0; try { chk = Number(lsGet(AIX_LS.chk) || 0); } catch (e) { }
+    if (Date.now() - chk > 6 * 3600 * 1000) setTimeout(() => { aixhubCheck(true); }, 80);
+  }
+}
+
+/* 净值账本：站点的 /api/*nav 都要登录 Cookie；只用用户本人粘贴的会话，不绕过登录。 */
+async function ledgermeCheck(silent) {
+  const c = ledgermeCookie();
+  if (!c || !nativeFetchAvailable() || _lgmChecking) return null;
+  _lgmChecking = true;
+  const r = await aixhubBridge("ledgermeCheck", [c], "净值账本");
+  _lgmChecking = false;
+  if (r && r.ok) {
+    lsSet(LGM_LS.user, r.user || "");
+    lsSet(LGM_LS.name, r.name || "");
+    lsSet(LGM_LS.chk, Date.now());
+    renderLedgerme();
+    if (!silent) toast("净值账本连接正常" + (r.name || r.user ? "：" + (r.name || r.user) : ""), 3600);
+    return r;
+  }
+  const dead = Number(r && r.status) === 401 || /401|Cookie|登录|失效|unauthor/i.test(String((r && r.message) || ""));
+  if (dead) {
+    lsDel(LGM_LS.cookie); lsDel(LGM_LS.user); lsDel(LGM_LS.name); lsDel(LGM_LS.at);
+    renderLedgerme();
+  }
+  if (!silent) toast(String((r && r.message) || "Cookie 检查失败").slice(0, 100), 5200);
+  return null;
+}
+function ledgermeCheckNow() { ledgermeCheck(false); }
+async function ledgermeLoginFlow() {
+  if (!nativeFetchAvailable()) return toast("净值账本连接只在 Android App 内可用（网页版没有本机桥）", 4600);
+  const tip = "把 ledgerme.me 的登录 Cookie 粘贴到这里\n"
+    + "（电脑/手机浏览器登录后：开发者工具 → Network → 任意 /api 请求 → Request Headers → Cookie）";
+  const c = (prompt(tip, ledgermeCookie() || "") || "").trim();
+  if (!c) return;
+  toast("正在验证 Cookie…", 1800);
+  const r = await aixhubBridge("ledgermeCheck", [c], "净值账本");
+  if (!r || !r.ok) return toast(String((r && r.message) || "Cookie 无效").slice(0, 100), 5600);
+  lsSet(LGM_LS.cookie, c);
+  lsSet(LGM_LS.user, r.user || "");
+  lsSet(LGM_LS.name, r.name || "");
+  lsSet(LGM_LS.chk, Date.now());
+  lsDel(LGM_LS.at);
+  renderLedgerme();
+  toast("净值账本已连接，手动抓取时会多查一条渠道", 4200);
+}
+function ledgermeLogout() {
+  lsDel(LGM_LS.cookie); lsDel(LGM_LS.user); lsDel(LGM_LS.name);
+  lsDel(LGM_LS.at); lsDel(LGM_LS.chk);
+  renderLedgerme();
+  toast("已断开净值账本，只走官网 + 中国理财网");
+}
+function renderLedgerme() {
+  const box = $("ledgermeBox"); if (!box) return;
+  const on = !!ledgermeCookie();
+  const who = ledgermeName() || ledgermeUser();
+  box.innerHTML = `
+    <div class="note ${on ? "g" : ""}">${on
+      ? `已连接：<b>${esc(who || "ledgerme.me")}</b><br>
+         只在点<b>「⚡ 立即抓取」</b>时查一次（3 分钟内不重复）。Cookie 只存本机，退出即删除。`
+      : `可选。ledgerme.me（欣盈净值账本）是另一条账本/代销渠道。它的净值接口要登录，<br>
+         需要你在浏览器登录后把 <b>Cookie</b> 粘贴进来；不登录不影响官网抓取。<br>
+         <span class="muted">仅使用你本人账号的会话，不绕过登录、不保存密码。</span>`}</div>
+    <div class="row-btn" style="margin-top:10px;flex-wrap:wrap">
+      <button class="btn ${on ? "gh" : "pri"}" style="flex:1 1 45%" onclick="ledgermeLoginFlow()">${on ? "更新 Cookie" : "连接净值账本"}</button>
+      ${on ? `<button class="btn gh" style="flex:1 1 45%" onclick="ledgermeCheckNow()">检查连接</button>` : ""}
+      ${on ? `<button class="btn gh" style="flex:1 1 45%" onclick="ledgermeLogout()">断开</button>` : ""}
+    </div>`;
+  if (on && !_lgmAutoTried) {
+    _lgmAutoTried = true;
+    let chk = 0; try { chk = Number(lsGet(LGM_LS.chk) || 0); } catch (e) { }
+    if (Date.now() - chk > 6 * 3600 * 1000) setTimeout(() => { ledgermeCheck(true); }, 120);
+  }
 }
 function nativeFetchAvailable() {
   try { return !!(window.NativeNav && window.NativeNav.ready && window.NativeNav.ready()); }
@@ -2344,7 +2608,7 @@ window.__navDone = function (id, res) {
   const f = _navDone[id]; if (!f) return;
   delete _navDone[id]; f(res);
 };
-function nativeNavFetch(p, withAixhub) {
+function nativeNavFetch(p, withAixhub, withLedgerme) {
   return new Promise(resolve => {
     const id = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     let settled = false;
@@ -2358,28 +2622,45 @@ function nativeNavFetch(p, withAixhub) {
         name: String(p.name || ""),
         inst: String(p.inst || ""),
         navHistory: p.navHistory || {},
-        aixhubToken: withAixhub ? aixhubToken() : ""
+        aixhubToken: withAixhub ? aixhubToken() : "",
+        ledgermeCookie: withLedgerme ? ledgermeCookie() : ""
       }));
     } catch (e) { clearTimeout(timer); finish({ ok: false, error: String(e) }); }
   });
 }
-async function nativeFetchAll(forceAixhub) {
+async function nativeFetchAll(forceExtra) {
   if (_nativeBusy) return;
   /* 本机抓取不依赖 GitHub：没配同步也能抓、能落盘；配了才会在抓到新净值后自动推送 */
   const list = DATA.products.filter(p => fetchStatus(p).ok);
   if (!list.length) { toast("没有可抓取的产品：请先在产品页补填产品代码或登记编码"); return; }
-  /* 秒讯只在你手动点「⚡ 立即抓取」时查（3 分钟内不重复）：
-     它的接口要登录态，后台定时轮询既没必要、也容易被风控；官网那条线照旧自动跑。 */
-  const aixOn = !!aixhubToken();
+  _nativeBusy = true;
+  /* 手动抓取前先确认秒讯登录态：过期就提前跳过，别等每只产品都撞一次 401。 */
+  if (forceExtra && aixhubToken()) await aixhubCheck(true);
+  /* 秒讯 / 净值账本只在你手动点「⚡ 立即抓取」时查（各 3 分钟内不重复）：
+     它们的接口要登录态，后台定时轮询既没必要、也容易被风控；官网那条线照旧自动跑。 */
+  const aixLi = aixhubLicInfo();
+  const aixOn = !!aixhubToken() && !aixLi.expired;
+  if (aixhubToken() && aixLi.expired) {
+    toast("秒讯会员已到期/状态异常，这次跳过秒讯（不影响官网抓取）", 4600);
+  }
   let lastAix = 0;
   try { lastAix = Number(localStorage.getItem(AIX_LS.at) || 0); } catch (e) { }
-  const withAixhub = aixOn && !!forceAixhub && Date.now() - lastAix > 3 * 60000;
-  if (aixOn && forceAixhub && !withAixhub) {
+  const withAixhub = aixOn && !!forceExtra && Date.now() - lastAix > 3 * 60000;
+  if (aixOn && forceExtra && !withAixhub) {
     toast("秒讯 3 分钟内刚查过，这次只抓官网（不影响结果）", 3000);
   }
-  if (withAixhub) { try { localStorage.setItem(AIX_LS.at, String(Date.now())); } catch (e) { } }
-  let aixErr = "";
-  _nativeBusy = true;
+  if (withAixhub) lsSet(AIX_LS.at, Date.now());
+
+  const lgmOn = !!ledgermeCookie();
+  let lastLgm = 0;
+  try { lastLgm = Number(localStorage.getItem(LGM_LS.at) || 0); } catch (e) { }
+  const withLedgerme = lgmOn && !!forceExtra && Date.now() - lastLgm > 3 * 60000;
+  if (lgmOn && forceExtra && !withLedgerme) {
+    toast("净值账本 3 分钟内刚查过，这次只抓官网（不影响结果）", 3000);
+  }
+  if (withLedgerme) lsSet(LGM_LS.at, Date.now());
+
+  let aixErr = "", lgmErr = "";
   try { localStorage.setItem("licai.nativeFetchAt", String(Date.now())); } catch (e) { }
   const t0 = Date.now();
   MANUAL = { state: "running", t0, native: true, total: list.length, done: 0, added: 0, fail: 0 };
@@ -2393,11 +2674,13 @@ async function nativeFetchAll(forceAixhub) {
     /* 已经有今天的净值就没必要再问秒讯，进一步减少请求 */
     const l0 = latestNav(p);
     const wantAix = withAixhub && (!l0 || l0[0] < today());
-    const r = await nativeNavFetch(p, wantAix);
+    const wantLgm = withLedgerme && (!l0 || l0[0] < today());
+    const r = await nativeNavFetch(p, wantAix, wantLgm);
     MANUAL.done = (MANUAL.done || 0) + 1;
     if (r && r.sources) {
       for (const s of r.sources) {
         if (s.src === "aixhub" && s.error) aixErr = s.error;
+        if (s.src === "ledgerme" && s.error) lgmErr = s.error;
       }
     }
     if (r && r.ok) {
@@ -2466,10 +2749,24 @@ async function nativeFetchAll(forceAixhub) {
     toast(added ? `本机抓取完成：新增 ${added} 条净值` + (fail ? `，${fail} 只失败` : "")
                 : `本机抓取完成：暂无新净值` + (fail ? `（${fail} 只失败）` : ""), 4200);
     if (aixErr && withAixhub) {
-      const dead = /401|登录|token|unauthor/i.test(aixErr);
+      const dead = /401|登录已失效|token|unauthor/i.test(aixErr);
+      const perm = /403|会员|权限/.test(aixErr);
       toast(dead ? "秒讯登录已失效，请到「设置 → 秒讯」重新登录（不影响官网抓取）"
-                 : "秒讯这次没取到：" + aixErr.slice(0, 60), 6000);
-      if (dead) { try { localStorage.removeItem(AIX_LS.at); } catch (e) { } }
+        : perm ? "秒讯会员/权限异常，请到秒讯确认会员状态（不影响官网抓取）"
+          : "秒讯这次没取到：" + aixErr.slice(0, 60), 6000);
+      if (dead) {
+        lsDel(AIX_LS.token); lsDel(AIX_LS.lic); lsDel(AIX_LS.at);
+        renderAixhub();
+      }
+    }
+    if (lgmErr && withLedgerme) {
+      const dead = /401|Cookie|登录|失效|unauthor/i.test(lgmErr);
+      toast(dead ? "净值账本 Cookie 已失效，请到「设置 → 净值账本」更新（不影响官网抓取）"
+        : "净值账本这次没取到：" + lgmErr.slice(0, 60), 6000);
+      if (dead) {
+        lsDel(LGM_LS.cookie); lsDel(LGM_LS.user); lsDel(LGM_LS.name); lsDel(LGM_LS.at);
+        renderLedgerme();
+      }
     }
   } finally {
     _nativeBusy = false;
@@ -2527,6 +2824,7 @@ async function syncPull(manual) {
     const before = navFingerprint();
     DATA = Object.assign({ products: [], trades: [], settings: {} }, remote);
     saveLocal();
+    applyCalendarConfig();   /* 云端可能补了新的年份 / 截止时间 */
     const pullVer = _POS_VER;
     /* 云端数据同样要过一遍迁移：合并重复产品、搬迁销售代码。
        若发生变更则回写云端 —— 抓取脚本读到正确的产品代码后才会抓到净值。 */
@@ -2554,7 +2852,7 @@ async function syncPush(manual) {
           刚写过），直接推就把云端刚写的抓取结果覆盖回旧值 —— 表现为「云端明明
           抓取失败了，App 的告警条却不出现」，而且不会有任何报错。
        ② 顺手拿到最新 sha，避免用陈旧 sha 提交导致 409 冲突。 */
-    let rs = {}, rpArr = null;
+    let rs = {}, rpArr = null, rtomb = null;
     try {
       const cur = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
       if (cur && cur.sha) {
@@ -2562,10 +2860,18 @@ async function syncPush(manual) {
         const robj = JSON.parse(b64ToUtf8(cur.content)) || {};
         rs = robj.settings || {};
         rpArr = Array.isArray(robj.products) ? robj.products : null;
+        rtomb = robj.tomb || null;
       }
     } catch (e) { /* 读不到远端就按本地推，不阻断正常保存 */ }
     if (!body.sha) {
       try { const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`); body.sha = info.sha; } catch (e) { }
+    }
+    /* 别的设备删除过的东西：先并合墓碑并在本地执行，再随本次 payload 一起推回去。
+       没有这一步，本机旧快照会把已删产品 / 交易 / 净值原样复活。 */
+    if (rtomb) {
+      mergeTombs(tombstones(), rtomb);
+      const removed = applyTombs(DATA);
+      if (removed) { saveLocal(); renderHome(); renderProd(); renderTrade(); }
     }
     /* payload 在 PUT 前才生成：网络往返期间的用户编辑不会丢出本次推送 */
     const payload = JSON.parse(JSON.stringify(DATA));
@@ -2584,13 +2890,17 @@ async function syncPush(manual) {
        只并入「本地没有的日期」；同日冲突保留本地值（用户显式补录优先）。
        按 id 匹配；云端有而本地没有的产品不回填 —— 那可能是本机刚删除的，回填会复活。 */
     if (rpArr) {
+      const navTomb = normTomb(payload.tomb).navs;
       const byId = new Map((payload.products || []).map(x => [String(x.id), x]));
       for (const rp of rpArr) {
         const lp = byId.get(String(rp.id));
         if (!lp || !rp.navHistory) continue;
         const lh = lp.navHistory || (lp.navHistory = {});
-        for (const d in rp.navHistory)
+        for (const d in rp.navHistory) {
+          /* 用户明确删过这一天（墓碑未过期）→ 不再从云端补回 */
+          if (navTomb[String(lp.id) + "|" + d]) continue;
           if (lh[d] === undefined || lh[d] === null || lh[d] === "") lh[d] = rp.navHistory[d];
+        }
       }
     }
     body.content = utf8ToB64(JSON.stringify(payload, null, 1));
@@ -2816,6 +3126,7 @@ function importJSON() {
         if (!o.products) throw new Error("格式不对");
         if (!confirm("导入将覆盖当前本地数据，确定？")) return;
         DATA = Object.assign({ products: [], trades: [], settings: {} }, o);
+        applyCalendarConfig();
         saveLocal(); renderHome(); renderTrade(); renderProd(); renderSet(); toast("已导入");
       } catch (e) { toast("导入失败：" + e.message); }
     };
@@ -2839,9 +3150,9 @@ function clearAll() {
    ⚠️ 新增内联 handler 时必须同步加进这个清单 ——
    tests/handlers.test.mjs 会扫描 index.html / app.js 里的内联调用做双向校验。 */
 Object.assign(window, {
-  addNav, aixhubLoginFlow, aixhubLogout, autoFillNav, bulkNav, calcShares, calMove, clearAll,
+  addNav, aixhubCheckNow, aixhubLoginFlow, aixhubLogout, autoFillNav, bulkNav, calcShares, calMove, clearAll,
   clearDetSearch, closeSheet, commitNav, delNav, delProd, delTrade, dismissAlert, editProd,
-  exportJSON, go, importJSON, ocrPick, ocrShot, onDetSearch, onProdCodeInput, openLinkAdd,
+  exportJSON, go, importJSON, ledgermeCheckNow, ledgermeLoginFlow, ledgermeLogout, ocrPick, ocrShot, onDetSearch, onProdCodeInput, onTradeDateChange, openLinkAdd,
   openNav, openProd, openProdDetail, openSync, openTrade, pickDay, pickProduct, previewLink,
   queryProduct, refreshNav, renderPick, renderTradeForm2, resetManualFetch, saveFromLink,
   saveProduct, saveSyncCfg, saveTrade, setDetInst, setDetSort, setDetTab, setGroup, setProdOv,
@@ -2850,6 +3161,7 @@ Object.assign(window, {
 
 (function init() {
   loadLocal();
+  applyCalendarConfig();   /* 先合并云端日历（settings.tradeCal），再渲染任何日期 */
   loadNotify();
   /* 启动即做一次数据迁移：销售代码→产品代码、重复产品合并 */
   const migrated = migrateData();
