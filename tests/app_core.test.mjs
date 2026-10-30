@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fmtDate } from "../js/core/util.js";
-import { detectOrg } from "../js/core/orgs.js";
+import { detectOrg, detectOrgByProdCode } from "../js/core/orgs.js";
 import { navSeries, latestNav, navOnOrBefore, navHit } from "../js/domain/nav.js";
 import { sharesOn, hasAnyTrade, computePosition } from "../js/domain/position.js";
 import { ocrNavLines } from "../js/domain/ocr.js";
@@ -82,6 +82,37 @@ test("机构识别：常见机构与易混对", () => {
   assert.equal(detectOrg({ name: "宁银理财 某产品" }), "wmbnb", "宁银不能被南银抢走");
   assert.equal(detectOrg({ name: "南银理财 某产品" }), "nanyin");
   assert.equal(detectOrg({ name: "中信银行代销" }), "citic");
+});
+
+test("机构识别：建信理财（jxwm，走建行在售清单渠道）", () => {
+  assert.equal(detectOrg({ inst: "建信理财" }), "jxwm");
+  assert.equal(detectOrg({ inst: "建信理财有限责任公司" }), "jxwm");
+  assert.equal(detectOrg({ name: "惠众日申季赎第8期", manager: "建信理财" }), "jxwm");
+  // 别名表按声明顺序匹配，已有发行方必须优先于「建行」这条渠道别名
+  assert.equal(detectOrg({ inst: "中国建设银行", name: "中银理财-稳富" }), "bocwm");
+});
+
+test("机构识别：浙银 / 青银 / 招银（2026-10-30 三家新直连源）", () => {
+  assert.equal(detectOrg({ inst: "浙银理财" }), "czbwm");
+  assert.equal(detectOrg({ name: "浙银理财琮融九曜添利90天" }), "czbwm");
+  assert.equal(detectOrg({ inst: "青银理财" }), "qdccb");
+  assert.equal(detectOrg({ inst: "招银理财" }), "cmbwm");
+  // 新别名追加在表尾：先声明的发行方不能被抢走
+  assert.equal(detectOrg({ inst: "宁银理财" }), "wmbnb", "宁银 ≠ 青银 / 浙银");
+  assert.equal(detectOrg({ inst: "杭银理财" }), "hangyin");
+  assert.equal(detectOrg({ inst: "中银理财" }), "bocwm");
+  assert.equal(detectOrg({ inst: "信银理财" }), "citic");
+  // 代销渠道名（微众/网商）仍然认不出发行方 —— 那类产品由云端货架反查负责
+  assert.equal(detectOrg({ inst: "微众银行", name: "阳光橙安盈季开9号D" }), "");
+  // 代码形态提示：浙银份额码可判；母代码要明确提醒补份额字母
+  assert.equal(detectOrgByProdCode("ZYJYG0044A").org, "czbwm");
+  assert.equal(detectOrgByProdCode("ZYFCG0044B").org, "czbwm", "浙银不止 ZYJYG 一个家族");
+  assert.equal(detectOrgByProdCode("ZYJYG00440").org, "czbwm");
+  assert.match(detectOrgByProdCode("ZYJYG00440").tip, /母代码/);
+  // 宁银的 Z+2 字母+7 位数字代码不能被浙银的 ZY… 规则抢走
+  assert.equal(detectOrgByProdCode("ZGN2360006C").org, "wmbnb");
+  // 招银 cfweb 用的是纯数字码，别家也可能是纯数字 → 故意不写规则，免误判
+  assert.equal(detectOrgByProdCode("132031D").org, "");
 });
 
 /* ---- 截图 OCR 的日期/净值配对 ---- */
