@@ -42,6 +42,7 @@ jobs:
           npm i --no-save --silent typescript@5.6.3
           npx tsc -p jsconfig.json
 
-      # T+1 确认口径、净值序列、机构识别、截图 OCR 配对、内联事件桥契约
+      # T+1 确认口径、净值序列、机构识别、截图 OCR 配对、内联事件桥契约、
+      # 墓碑、整文件同步的合并语义（syncPush 不能删掉云端独有条目）
       - name: 纯逻辑测试
-        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs tests/calendar.test.mjs tests/tomb.test.mjs
+        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs tests/calendar.test.mjs tests/tomb.test.mjs tests/sync_merge.test.mjs

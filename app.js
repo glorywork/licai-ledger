@@ -14,12 +14,14 @@ import { $, pad, fmtDate, parseDate, today, money, signMoney, pct, cls, uid, esc
   from "./js/core/util.js";
 import { ORG_NAME, detectOrg, detectOrgByProdCode, prodCodeOf, fetchStatus }
   from "./js/core/orgs.js";
+import { parseProductInput, rowAddable } from "./js/core/paste.js";
 import { navSeries, navAt, navOnOrBefore, latestNav, navHit } from "./js/domain/nav.js";
 import { sharesOn as sharesOnWith, hasAnyTrade as hasAnyTradeIn,
   computePosition } from "./js/domain/position.js";
 import { ocrNavLines } from "./js/domain/ocr.js";
 import { configureCalendar, suggestTradeDates, tradeDaysBetween } from "./js/domain/calendar.js";
 import { normTomb, mergeTombs, purgeTombs, applyTombs as applyTombsIn } from "./js/domain/tomb.js";
+import { mergeForPush } from "./js/domain/sync.js";
 
 /* ---------- 常量 ---------- */
 const LS_DATA = "licai_ledger_v1";
@@ -33,7 +35,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v43";
+const APP_VER = "v44";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -1214,88 +1216,8 @@ function saveProduct(pid) {
   autoPush();
 }
 
-/* ============================================================
-   粘贴链接添加产品
-   ------------------------------------------------------------
-   为什么前端只做「抽键 + 判机构」、不抓页面：
-     跨域会被 CORS 拦死（这正是当初把抓取挪到 GitHub Actions 的原因），
-     而各行分享链接的 query 里基本都直接带着可用代码 ——
-     中国理财网 prodRegCode、北银 PROD_CODE、宁银 projectcode …
-
-   ★ 云端契约（勿改，改了这里会静默失效）：
-     fetch_nav.py 的 detect_org() 只看 inst / name / prodCode / code …
-     里的**关键词**，不看产品代码形态。所以用链接建产品时**必须把识别到的
-     机构名写进 inst**（如「北银理财」），否则云端会因「机构未识别 + 无名称」
-     直接跳过该产品，表现为「加了产品但永远抓不到净值」。
-     另外名称**故意留空**：merge_nav 只在字段为空时回填，留空云端才能把
-     真实产品名（来自中国理财网 productDetail）写上。
-   ============================================================ */
-const LINK_REG_KEYS = ["prodregcode", "regcode", "registercode", "zcode", "instcode",
-  "financingregistercode", "cpdjbm", "cpdjjbm"];
-const LINK_PROD_KEYS = ["prodcode", "productcode", "projectcode", "productid",
-  "sharecode", "salescode", "fundcode", "cpbm", "code"];
-
-/* 解析用户粘贴的链接/代码/文本 → { code, prodCode, org, ok, msg } */
-function parseProductInput(raw) {
-  const text = String(raw == null ? "" : raw).trim();
-  const norm = s => String(s).toUpperCase().replace(/[\s"']/g, "");
-  if (!text) return { code: "", prodCode: "", org: "", ok: false, msg: "请粘贴产品链接、产品代码或登记编码" };
-
-  /* ① 收集参数：URL query、hash 路由里的 query，以及「名称=值」形式的参数串 */
-  const params = {};
-  const eatQuery = (s) => {
-    const i = s.indexOf("?");
-    if (i < 0) return;
-    s.slice(i + 1).split("&").forEach(kv => {
-      const j = kv.indexOf("=");
-      if (j <= 0) return;
-      const k = kv.slice(0, j).toLowerCase().trim();
-      let v = kv.slice(j + 1).trim();
-      try { v = decodeURIComponent(v); } catch (e) { /* 原样保留 */ }
-      if (k && v) params[k] = v;
-    });
-  };
-  eatQuery(text);
-  const hi = text.indexOf("#");
-  if (hi >= 0) eatQuery(text.slice(hi));
-  text.replace(/([A-Za-z_]{3,24})\s*=\s*([^&\s]{4,40})/g, (m, k, v) => {
-    const kk = k.toLowerCase();
-    if (!params[kk]) params[kk] = v;
-    return m;
-  });
-  const pickParam = (keys) => { for (const k of keys) if (params[k]) return norm(params[k]); return ""; };
-
-  let code = pickParam(LINK_REG_KEYS);
-  let prodCode = pickParam(LINK_PROD_KEYS);
-  /* 参数值形态不对就不认（避免 ?code=weixin 之类被当成产品代码） */
-  if (code && !/^[ZC]\d{12,14}$/.test(code)) code = "";
-  if (prodCode && !detectOrgByProdCode(prodCode).org
-    && !/^[ZC]\d{12,14}$/.test(prodCode) && !/^[A-Z0-9]{6,20}$/.test(prodCode)) prodCode = "";
-
-  /* ② 全文候选兜底：切成「连续字母数字串」逐个用现有形态识别器归类 ——
-        不能直接全文正则扫，否则 Z7008926000006 里的 12 位数字会被误当成华夏的 12 位产品代码 */
-  const tokens = (text.match(/[A-Za-z0-9]{6,24}/g) || []).map(norm);
-  for (const tk of tokens) {
-    if (!code && /^[ZC]\d{12,14}$/.test(tk)) { code = tk; continue; }
-    if (!prodCode && detectOrgByProdCode(tk).org) prodCode = tk;
-  }
-
-  /* ③ 判机构 */
-  let org = prodCode ? detectOrgByProdCode(prodCode).org : "";
-  if (!org && code) org = "chinawealth";
-  const okay = !!(code || prodCode);
-  let msg = "";
-  if (!okay) {
-    msg = "没从这段内容里认出产品代码或登记编码。若是银行代销产品的代码（如中行 EW4455D 这类），"
-      + "请连同「登记编码」（Z 开头）一起贴上 —— 云端靠登记编码或产品名称查询，只有产品代码查不到";
-  } else if (prodCode && !code && !org) {
-    /* 银行代销链接的常见形态：能认出产品代码，但发行人不在已知名单里（2026-09-16 中行 EW4455D 实例）。
-       此时云端既无登记编码也无名称 → 会以「无法识别机构」跳过，必须提前提示。 */
-    msg = `已识别产品代码 ${prodCode}，但发行机构未识别：请补填「登记编码」（Z 开头，`
-      + "产品说明书或中国理财网可查），否则云端抓不到该产品净值";
-  }
-  return { code, prodCode, org, ok: okay, msg };
-}
+/* 粘贴内容 → 产品键：纯函数已拆到 js/core/paste.js（可被 node --test 直接测）。
+   这里只保留依赖 DATA / DOM 的去重、预览与落库。 */
 
 /* 产品显示名：链接添加的骨架产品名称是空的（留给云端回填），列表要有兜底 */
 function prodLabel(p) {
@@ -1315,10 +1237,11 @@ function openLinkAdd() {
     <div class="note b" style="margin-bottom:12px">
       把<b>产品页面链接</b>（银行 App / 微信里复制的那条）粘进来即可。<b>一行一只，可以一次贴很多行。</b><br>
       链接里带产品代码或登记编码时自动识别；若贴的是公众号文章之类的链接，
-      请把<b>登记编码</b>或<b>产品代码</b>一并贴上。
+      请把<b>登记编码</b>或<b>产品代码</b>一并贴上。只有代码时<b>让它单独占一行</b>
+      （如 <b>25112035B</b>），和别的文字混在一行时可能认不出来。
     </div>
     <div class="field"><label>粘贴链接 / 代码 / 含代码的文本（可多行）</label>
-      <textarea id="lkInput" rows="5" oninput="previewLink()" placeholder="每行一只产品，例如：&#10;https://…?PROD_CODE=YJ01251204A&#10;https://…?prodRegCode=Z7008926000006&#10;ZGN2360006C"
+      <textarea id="lkInput" rows="5" oninput="previewLink()" placeholder="每行一只产品，例如：&#10;https://…?PROD_CODE=YJ01251204A&#10;https://…?prodRegCode=Z7008926000006&#10;25112035B（二维码里的产品代码，单独一行）"
         style="width:100%;padding:11px 12px;border:1.5px solid var(--line);border-radius:11px;font-size:13px;font-family:inherit;color:var(--ink);outline:none;resize:vertical"></textarea>
     </div>
     <button class="btn gh full" onclick="qrPick()">📱 扫二维码添加（微众分享海报）</button>
@@ -1329,7 +1252,7 @@ function openLinkAdd() {
       <input id="lkName" placeholder="留空即可">
     </div>
     <div class="field"><label>发行机构 <span class="muted">（识别不出机构的行靠它兜底）</span></label>
-      <input id="lkInst" placeholder="如 北银理财有限责任公司">
+      <input id="lkInst" placeholder="如 北银理财有限责任公司" oninput="previewLink()">
       <div class="tip">云端靠这个字段选数据源：填理财公司全名（含「理财」即可），识别出代码时会自动补上</div>
     </div>
     <div class="row-btn">
@@ -1341,32 +1264,42 @@ function openLinkAdd() {
 }
 
 /* 多行粘贴：每行当一个产品解析，**每行都有结果**（不认识的不会被静默丢掉）。
-   单行仍走原来那套更详细的说明，老用户看到的东西不变。 */
+   单行仍走原来那套更详细的说明，老用户看到的东西不变。
+   ★ 批内同码也要标成 dup：预览算「可添加几只」时如果只看 DATA、不看本批，
+     两行相同的代码会被数成 2 只，而保存循环里的 findDupProduct 只会落 1 只
+     （2026-10-30 审计抓到的不同源）。 */
 function parseProductLines(text) {
   const rows = [];
+  const seen = new Map();           /* 本批已出现的产品键 -> 首次出现的行号 */
   String(text == null ? "" : text).split(/\r?\n/).forEach((raw, i) => {
     const line = raw.trim();
     if (!line) return;
     const r = parseProductInput(line);
     if (!r.ok) { rows.push({ ln: i + 1, raw: line, r, status: "bad", key: "", note: r.msg }); return; }
+    const key = (r.prodCode || r.code || "").toUpperCase();
     const dup = findDupProduct(r);
+    const twin = key && seen.get(key);
+    if (key && !seen.has(key)) seen.set(key, i + 1);
     rows.push({
       ln: i + 1, raw: line, r,
-      status: dup ? "dup" : "add",
+      status: (dup || twin) ? "dup" : "add",
       key: r.prodCode || r.code,
       inst: ORG_NAME[r.org] || "",
       note: dup ? `已存在「${prodLabel(dup)}」`
-        : (ORG_NAME[r.org] || (r.code ? "识别不出机构，需手填机构名"
-          : "机构未识别 + 无登记编码：请手填发行机构，并补登记编码（Z 开头），否则云端抓不到")),
+        : twin ? `与本批第 ${twin} 行同码，只加一次`
+        : (ORG_NAME[r.org] || (r.code ? "有登记编码，机构可留空（中国理财网按编码取）"
+          : "机构未识别：云端会先拿代码去微众/网商货架反查，查到就能取净值；"
+            + "查不到则要手填发行机构，并补登记编码（Z 开头）")),
     });
   });
   return rows;
 }
 
-/* 按钮文案跟着预览走：写「确认添加 N 只」就只会加这 N 只 */
-function setLinkSave(n) {
+/* 按钮文案跟着预览走：写「确认添加 N 只」就只会加这 N 只。
+   why：一只都加不了时说明原因（缺机构、已存在），别让用户点下去才知道。 */
+function setLinkSave(n, why) {
   const b = $("lkSave"); if (!b) return;
-  b.textContent = n ? `确认添加 ${n} 只` : "没有可添加的产品";
+  b.textContent = n ? `确认添加 ${n} 只` : (why || "没有可添加的产品");
   b.disabled = !n;
 }
 
@@ -1389,53 +1322,85 @@ function previewLink() {
   }
   if (single) {
     const r = single.r;
+    /* 认不出的一行不能被算成「可添加 1 只」：以前按钮写「确认添加 1 只」、点下去才
+       toast「没有可添加的产品」—— 扫微众海报（华夏销售码 25112035B，形态表不认）
+       踩到的就是这条。现在解析层已收裸码，这里再兜一道，两者不一致时以「不可加」为准。 */
+    if (single.status === "bad") {
+      box.innerHTML = `<div class="note" style="margin-bottom:12px">${esc(r.msg || "这一行没认出产品代码或登记编码")}</div>`;
+      setLinkSave(0);
+      return;
+    }
     const dup = single.status === "dup" ? findDupProduct(r) : null;
+    /* 机构：形态识别出来的优先，其次取用户在下方「发行机构」栏填的（扫码那条会先填好） */
+    const manual = (instEl || {}).value ? String(instEl.value).trim() : "";
+    const inst = (r.org && (ORG_NAME[r.org] || r.org)) || manual;
+    /* 能不能真加，判据要和 saveFromLink **同一个函数**（js/core/paste.js rowAddable）：
+       有机构 / 有登记编码 / 整行裸码 三者之一才放行 —— 按钮不能承诺了再拒绝。 */
+    const canAdd = !dup && rowAddable(r, manual);
     const parts = [];
     if (r.code) parts.push(`登记编码 <b>${esc(r.code)}</b>`);
     if (r.prodCode) parts.push(`产品代码 <b>${esc(r.prodCode)}</b>`);
-    if (r.org) parts.push(`识别机构 <b>${esc(ORG_NAME[r.org] || r.org)}</b>`);
+    if (inst) parts.push(`发行机构 <b>${esc(inst)}</b>`);
     box.innerHTML = `<div class="note${dup ? "" : " g"}" style="margin-bottom:12px">
       ${parts.join(" · ")}<br>
       ${dup ? `⚠️ 已存在同代码产品「${esc(prodLabel(dup))}」，无需重复添加`
         : (r.code ? "保存后同步到云端，下一次抓取自动补全产品名称与历史净值。"
-          : "⚠️ 还缺<b>登记编码</b>（Z 开头）：云端要靠它或产品名称去查询，"
-            + "请从产品说明书 / 中国理财网查到后填进「登记编码」栏（名称可留空，抓取后自动回填）。")}
+          : (inst
+            ? "没有登记编码也能抓：云端按「产品代码 + 发行机构」选源，"
+              + "在微众/网商货架上的产品还会直接按代码取现值。抓不到时再补登记编码（Z 开头）。"
+            : (r.bare
+              ? "机构栏留空也能试：云端先拿这个代码去微众/网商货架目录（454 只）反查发行方，"
+                + "查到就直接取净值；反查不到再来补「发行机构」或登记编码（Z 开头）。"
+              : "⚠️ 机构栏还空着：请在下方「发行机构」填理财公司全名（如「华夏理财」），"
+                + "或补登记编码（Z 开头）—— 两个都没有，云端会以「无法识别机构」跳过这只。")))}
     </div>`;
-    setLinkSave(dup ? 0 : 1);
+    setLinkSave(canAdd ? 1 : 0, dup ? "已在台账里" : "先填发行机构");
     return;
   }
   const c = { add: 0, dup: 0, bad: 0 };
   rows.forEach(x => { c[x.status] = (c[x.status] || 0) + 1; });
-  box.innerHTML = `<div class="note${c.add ? " g" : ""}" style="margin-bottom:12px">
-      <b style="color:var(--brand)">${c.add}</b> 只可添加&nbsp;&nbsp;
+  /* 多行：机构栏是「兜底」用的，填了就对所有缺机构的行生效；
+     判据与保存端同一个函数，且批内同码只算一只（见 parseProductLines） */
+  const manualM = (instEl || {}).value ? String(instEl.value).trim() : "";
+  const nAdd = rows.filter(x => x.status === "add" && rowAddable(x.r, manualM)).length;
+  const nBlocked = rows.filter(x => x.status === "add").length - nAdd;
+  box.innerHTML = `<div class="note${nAdd ? " g" : ""}" style="margin-bottom:12px">
+      <b style="color:var(--brand)">${nAdd}</b> 只可添加&nbsp;&nbsp;
       <b style="color:var(--ink3)">${c.dup}</b> 只已存在&nbsp;&nbsp;
       <b style="color:var(--gold)">${c.bad}</b> 行无法识别
+      ${nBlocked ? `&nbsp;&nbsp;<b style="color:var(--gold)">${nBlocked}</b> 只缺机构/编码` : ""}
     </div>
     <div style="max-height:200px;overflow:auto"><table class="navtbl">
       <thead><tr><th>产品键</th><th style="text-align:left">机构 / 说明</th></tr></thead>
       <tbody>${rows.slice(0, 40).map(x => `<tr>
         <td>${esc(x.key || "—")}</td>
-        <td style="text-align:left;font-size:11px;color:var(${x.status === "bad" ? "--gold" : "--ink3"})">${esc(x.note)}</td>
+        <td style="text-align:left;font-size:11px;color:var(${x.status !== "add" || !rowAddable(x.r, manualM) ? "--gold" : "--ink3"})">${esc(x.note)}</td>
       </tr>`).join("")}</tbody></table></div>
     ${rows.length > 40 ? `<div class="muted" style="font-size:11px;padding:6px 0">只显示前 40 行（共 ${rows.length} 行）</div>` : ""}`;
-  setLinkSave(c.add);
+  setLinkSave(nAdd, nBlocked ? "先填发行机构" : "");
 }
 
 function saveFromLink() {
   if (!$("mask").classList.contains("show")) return;   /* 防快速双击重复添加 */
   /* 用预览时那份解析结果 —— 按钮上写多少只，就只加多少只 */
   const rows = UI.linkRows || parseProductLines($("lkInput") ? $("lkInput").value : "");
-  const adds = rows.filter(x => x.status === "add");
+  const manualInst = ($("lkInst").value || "").trim();
+  /* 能落库的行 = 预览里算「可添加」的那些：两边调的是同一个 rowAddable
+     （js/core/paste.js），批内同码也已在 parseProductLines 标成 dup。
+     剩下只有链接里一个 prodCode 参数、又认不出发行方的仍然挡住 —— 货架反查
+     不到的就是一条永远抓不到净值的空记录，不如让用户先补一项。 */
+  const adds = rows.filter(x => x.status === "add" && rowAddable(x.r, manualInst));
   if (!adds.length) {
     const dupN = rows.filter(x => x.status === "dup").length;
-    return toast(dupN ? `已存在的 ${dupN} 只无需重复添加` : "没有可添加的产品");
+    const needInst = rows.filter(x => x.status === "add").length;
+    return toast(dupN ? `已存在的 ${dupN} 只无需重复添加`
+      : (needInst ? `还有 ${needInst} 只认不出发行机构：在「发行机构」栏填理财公司全名（如 招银理财），或补登记编码（Z 开头）`
+        : "没有可添加的产品"), 4600);
   }
-  const manualInst = ($("lkInst").value || "").trim();
   const name = ($("lkName").value || "").trim();     /* 允许留空：留给云端 merge_nav 回填 */
-  let ok = 0, noInst = 0;
+  let ok = 0;
   for (const x of adds) {
     const inst = x.inst || manualInst;
-    if (!inst) { noInst++; continue; }               /* 没机构云端选不了数据源，加了也是废条 */
     if (findDupProduct(x.r)) continue;               /* 同一批里重复的代码，第二条在这里被挡下 */
     DATA.products.push({
       id: uid(), navHistory: {}, createdAt: Date.now(),
@@ -1445,11 +1410,7 @@ function saveFromLink() {
     });
     ok++;
   }
-  if (!ok) {
-    return toast(noInst
-      ? `请填写发行机构（如 招银理财）—— 云端据此选择数据源（${noInst} 只缺机构）`
-      : "没有可添加的产品", 4200);
-  }
+  if (!ok) return toast("这些代码已经在台账里了", 3600);
   saveLocal(); closeSheet();
   if (rows.length === 1 && ok === 1) {
     const st = fetchStatus(DATA.products[DATA.products.length - 1]);
@@ -2912,20 +2873,17 @@ async function syncPush(manual) {
   const body = { message: `update ledger ${new Date().toISOString().slice(0, 16)}` };
   try {
     /* 推之前先读一次远端。两个原因，都跟「整文件替换」有关：
-       ① GitHub Contents PUT 是整文件替换，而 settings 里的 lastNavSync / lastFetch
-          是**抓取脚本的**字段。如果本机副本比云端旧（Action 在我们打开页面之后
-          刚写过），直接推就把云端刚写的抓取结果覆盖回旧值 —— 表现为「云端明明
-          抓取失败了，App 的告警条却不出现」，而且不会有任何报错。
+       ① GitHub Contents PUT 是整文件替换：payload 里少一块，云端就少一块。远端现势
+          必须整个交给 mergeForPush（云端独有的产品 / 交易 / 净值日期、抓取脚本写的
+          settings、别的设备写下的墓碑都靠它补回来）。
        ② 顺手拿到最新 sha，避免用陈旧 sha 提交导致 409 冲突。 */
-    let rs = {}, rpArr = null, rtomb = null;
+    /** @type {any} */
+    let robj = {};
     try {
       const cur = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
       if (cur && cur.sha) {
         body.sha = cur.sha;
-        const robj = JSON.parse(b64ToUtf8(cur.content)) || {};
-        rs = robj.settings || {};
-        rpArr = Array.isArray(robj.products) ? robj.products : null;
-        rtomb = robj.tomb || null;
+        robj = JSON.parse(b64ToUtf8(cur.content)) || {};
       }
     } catch (e) { /* 读不到远端就按本地推，不阻断正常保存 */ }
     if (!body.sha) {
@@ -2933,41 +2891,19 @@ async function syncPush(manual) {
     }
     /* 别的设备删除过的东西：先并合墓碑并在本地执行，再随本次 payload 一起推回去。
        没有这一步，本机旧快照会把已删产品 / 交易 / 净值原样复活。 */
-    if (rtomb) {
-      mergeTombs(tombstones(), rtomb);
+    if (robj.tomb) {
+      mergeTombs(tombstones(), robj.tomb);
       const removed = applyTombs(DATA);
       if (removed) { saveLocal(); renderHome(); renderProd(); renderTrade(); }
     }
-    /* payload 在 PUT 前才生成：网络往返期间的用户编辑不会丢出本次推送 */
-    const payload = JSON.parse(JSON.stringify(DATA));
+    /* payload 在 PUT 前才生成：网络往返期间的用户编辑不会丢出本次推送。
+       合并规则（不改动 DATA、云端独有条目保留、净值只补日期、同日保留本地、
+       墓碑有效期内不复活、settings 取更新的一份）全在 js/domain/sync.js 里，可测；
+       这里只负责网络与 sha。 */
+    const { payload, stats } = mergeForPush(DATA, robj);
     const _pushVer = _POS_VER;   /* payload 快照对应的数据版本（推送成功后据此决定是否清 dirty） */
-    payload.settings = payload.settings || {};
-    for (const k of ["lastNavSync", "lastFetch"]) {
-      const a = rs[k], b = payload.settings[k];
-      /* 用 time 比较新旧；云端没有就保留本地，都没写就跳过 */
-      const ta = a ? String(a.time || a) : "";
-      const tb = b ? String(b.time || b) : "";
-      if (ta && ta > tb) payload.settings[k] = a;
-    }
-    /* v32 P0-1：云端独有净值并入 payload。
-       PUT 是整文件替换，payload 里的 navHistory 是打开页面时的旧快照 ——
-       不合并的话，App 开着期间云端 Actions 刚抓到的新净值会被这次推送抹掉。
-       只并入「本地没有的日期」；同日冲突保留本地值（用户显式补录优先）。
-       按 id 匹配；云端有而本地没有的产品不回填 —— 那可能是本机刚删除的，回填会复活。 */
-    if (rpArr) {
-      const navTomb = normTomb(payload.tomb).navs;
-      const byId = new Map((payload.products || []).map(x => [String(x.id), x]));
-      for (const rp of rpArr) {
-        const lp = byId.get(String(rp.id));
-        if (!lp || !rp.navHistory) continue;
-        const lh = lp.navHistory || (lp.navHistory = {});
-        for (const d in rp.navHistory) {
-          /* 用户明确删过这一天（墓碑未过期）→ 不再从云端补回 */
-          if (navTomb[String(lp.id) + "|" + d]) continue;
-          if (lh[d] === undefined || lh[d] === null || lh[d] === "") lh[d] = rp.navHistory[d];
-        }
-      }
-    }
+    if (stats.products || stats.trades)
+      console.info(`同步：本次推送保留了云端独有的 ${stats.products} 只产品 / ${stats.trades} 笔交易`);
     body.content = utf8ToB64(JSON.stringify(payload, null, 1));
     /* 只把合并后的两个抓取脚本字段留在本地，不整段覆盖 settings
        （旧写法 DATA.settings = payload.settings 会用网络往返前的旧快照回写） */

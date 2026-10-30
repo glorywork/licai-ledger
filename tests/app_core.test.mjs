@@ -6,11 +6,13 @@
      · T+1 确认口径（份额什么时候算进持仓）
      · 净值序列取值（最新 / 指定日之前）
      · 机构识别（前端说能抓、云端才抓得到）
+     · 粘贴添加的解析（扫微众海报得到的裸码必须收，噪声必须挡）
      · 截图 OCR 的「日期 + 净值」配对（错一行就是错一笔账） */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fmtDate } from "../js/core/util.js";
 import { ORG_ALIAS, ORG_NAME, detectOrg, detectOrgByProdCode } from "../js/core/orgs.js";
+import { parseProductInput } from "../js/core/paste.js";
 import { navSeries, latestNav, navOnOrBefore, navHit } from "../js/domain/nav.js";
 import { sharesOn, hasAnyTrade, computePosition } from "../js/domain/position.js";
 import { ocrNavLines } from "../js/domain/ocr.js";
@@ -139,6 +141,58 @@ test("机构识别：光大理财（cebwm，走母公司光大银行的披露页
   assert.equal(detectOrgByProdCode("EW4455D").org, "");
 });
 
+/* ---- 粘贴添加：链接 / 代码 / 文本 → 产品键 ----
+   2026-10-30 的线上事故：扫微众海报得到华夏销售码 25112035B，
+   形态表只写了「华夏 = 12 位数字」，于是解析判「不认识」、行 status=bad，
+   而按钮仍写「确认添加 1 只」——点下去才 toast「没有可添加的产品」。
+   裸码现在直接收（paste.js ②b），认不出的形态必须一路挡住。 */
+test("粘贴：整行是微众/别家销售码时直接收下（不等形态表认识）", () => {
+  const r = parseProductInput("25112035B");
+  assert.equal(r.ok, true, "扫码得到的裸码必须算识别成功");
+  assert.equal(r.prodCode, "25112035B");
+  assert.equal(r.bare, true);
+  assert.equal(r.org, "", "8 位数字+份额字母不是华夏的已知形态，机构靠云端货架反查或用户手填");
+  assert.match(r.msg, /发行机构/);
+  /* 大小写、首尾空格、中文标签、句末标点都不该影响 */
+  for (const s of [" 25112035b ", "产品代码：25112035B", "微众 稳健理财 25112035B", "25112035B。"]) {
+    assert.equal(parseProductInput(s).prodCode, "25112035B", `${s} 应解析出同一个代码`);
+  }
+});
+
+test("粘贴：不像代码的文本不能被当成产品代码", () => {
+  /* 纯字母词、结尾不是代码的产品名、公众号链接里的随机串、净值行 */
+  const bad = ["HELPHELP", "华夏理财 固收纯债日开35号B",
+    "https://mp.weixin.qq.com/s/AbCdEf123456", "净值1.0356 2026年10月28日", ""];
+  for (const s of bad) {
+    const r = parseProductInput(s);
+    assert.equal(r.ok, false, `${s || "(空)"} 不该被认成产品`);
+    assert.equal(r.prodCode, "");
+    assert.equal(r.code, "");
+  }
+});
+
+test("粘贴：微众分享短链要说清「代码在跳转里」", () => {
+  const r = parseProductInput("https://gzhjdata.webank.com/hj/su/3Fk9Qm");
+  assert.equal(r.ok, false, "浏览器跨域跟不了 302，不能假装认出来了");
+  assert.match(r.msg, /二维码/);
+});
+
+test("粘贴：链接参数与登记编码照旧", () => {
+  let r = parseProductInput("https://x.com/a?prodRegCode=Z7008926000006");
+  assert.equal(r.code, "Z7008926000006");
+  assert.equal(r.org, "chinawealth");
+  assert.equal(r.ok, true);
+  r = parseProductInput("https://m.example.cn/p?PROD_CODE=YJ01251204A");
+  assert.equal(r.prodCode, "YJ01251204A");
+  assert.equal(r.org, "bob", "北银的形态表认识，机构自动填好");
+  assert.equal(r.bare, false);
+  r = parseProductInput("ZGN2360006C");
+  assert.deepEqual([r.prodCode, r.org, r.ok], ["ZGN2360006C", "wmbnb", true]);
+  r = parseProductInput("Z7008926000006");
+  assert.equal(r.code, "Z7008926000006", "整行是登记编码时归到 code，不能被裸码规则抢走");
+  assert.equal(r.bare, false);
+});
+
 /* ---- 截图 OCR 的日期/净值配对 ---- */
 test("OCR：日期与净值分处上下两行", () => {
   const rows = ocrNavLines(["净值日期", "2026-10-28", "单位净值", "1.015553", "日涨幅 0.01%"].join("\n"));
@@ -158,12 +212,62 @@ test("OCR：两日期小数位不足的数字不误判为净值", () => {
   /* 0.01% 这种两位小数不该被当成净值；没有净值的那一行直接丢弃 */
   assert.deepEqual(ocrNavLines("2026-10-28\n日涨幅 0.01%"), []);
 });
+/* ---- 「按钮说能加」与「点下去真能加」必须同源 ----
+   这次的事故就是 previewLink 算出「确认添加 1 只」、saveFromLink 又拒绝。
+   判据已经抽成 paste.js 的 rowAddable，所以能**真跑**；上一版这里是文本匹配，
+   测绿只证明字符串存在，不证明两处同源（审计指出后改掉）。 */
+test("粘贴添加：rowAddable 真执行 —— 放行与拦住的边界", async () => {
+  const { rowAddable } = await import("../js/core/paste.js");
+  const P = s => parseProductInput(s);
+  /* 放行：识别出机构 / 机构栏填了 / 有登记编码 / 整行裸码 */
+  assert.equal(rowAddable(P("https://m.example.cn/p?PROD_CODE=YJ01251204A"), ""), true, "北银形态认出发行方");
+  assert.equal(rowAddable(P("Z7008926000006"), ""), true, "只有登记编码也能抓（中国理财网）");
+  assert.equal(rowAddable(P("25112035B"), ""), true, "裸码：云端按代码去货架反查");
+  assert.equal(rowAddable(P("https://x.cn/a?prodCode=QQQQQQ1"), "华夏理财"), true, "认不出发行方但机构栏填了");
+  /* 拦住：解析失败、或只有个认不出的产品代码且机构栏空着 */
+  assert.equal(rowAddable(P("HELPHELP"), ""), false, "没认出来的一律不可加");
+  assert.equal(rowAddable(P(""), ""), false);
+  assert.equal(rowAddable(P("https://x.cn/a?prodCode=QQQQQQ1"), ""), false, "既没机构也没登记编码");
+  assert.equal(rowAddable(null, "华夏理财"), false);
+  /* app.js 两处必须真的都在调这个函数（抽出去了还各写一遍 = 又要不同源） */
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("../app.js", import.meta.url), "utf8");
+  const seg = (from, to) => {
+    const i = src.indexOf(from), j = src.indexOf(to, i);
+    assert.ok(i > 0 && j > i, `app.js 里找不到 ${from} → ${to}`);
+    return src.slice(i, j);
+  };
+  assert.match(seg("function previewLink", "function saveFromLink"), /rowAddable/, "预览没走同一个判据函数");
+  assert.match(seg("function saveFromLink", "\nfunction openNav"), /rowAddable/, "落库没走同一个判据函数");
+});
+
+test("粘贴：代码 + 金额 / 手机号 / 日期串 / 身份证 不能被粘成一个产品代码", () => {
+  /* 审计实测出的误收面：norm 会吃掉空格，老写法把整行当一个串取尾，
+     "25112035B 10000" 被合成 "25112035B10000"。现在按空白切词取末词。 */
+  const bad = ["25112035B 10000", "25112035B 2026", "2500 25112035B", "2026 25112035B",
+    "13800138000", "20261028", "110101199001011234", "https://x.cn/AB123456"];
+  for (const s of bad) {
+    const r = parseProductInput(s);
+    assert.equal(r.ok, false, `${s} 不该被当成产品代码`);
+  }
+  /* 占位参数：?code=weixin → WEIXIN 是 6 位纯字母，正好蒙过长度关（注释一直
+     声称排除了它，其实没有）。参数值现在必须含数字。 */
+  const w = parseProductInput("https://mp.weixin.qq.com/s?code=weixin&id=123");
+  assert.equal(w.prodCode, "", "?code=weixin 不能当产品代码");
+  /* 带标签 / 句末标点 / 大小写仍然要收（这才是 ②b 存在的理由） */
+  assert.equal(parseProductInput("产品代码：25112035B").prodCode, "25112035B");
+  assert.equal(parseProductInput("25112035B。").prodCode, "25112035B");
+  assert.equal(parseProductInput("微众 稳健理财 25112035B").prodCode, "25112035B");
+});
+
 /* ---- 前后端机构识别一致性（把两边逐字比对，以前只靠人肉核对）----
    navsources/base.py 在 licai-data 仓库里，Web CI 的检出没有这一份 →
    文件不在就跳过（本地两边同树，跑得到）。 */
 test("ORG_ALIAS：前端这张表必须与云端逐字同序", async () => {
   const fs = await import("node:fs");
-  const path = "../navsources/base.py";
+  /* 同上：用 import.meta.url 解析，从仓根跑 npm test 时 "../navsources/base.py"
+     会被算到仓外，于是这条门禁一路「文件不在 → 跳过」，白过。 */
+  const path = new URL("../navsources/base.py", import.meta.url);
   if (!fs.existsSync(path)) return;              // licai-ledger 单独检出时无此文件
   const src = fs.readFileSync(path, "utf8");
   const block = src.split("ORG_ALIAS = {")[1].split("\n}")[0];
