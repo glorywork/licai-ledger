@@ -45,6 +45,13 @@ export const ORG_ALIAS = [
      整表翻页取最新净值（2026-09-16 接入）。产品代码形态极杂（1XFTLFB307A / LJR121 /
      HYGWCY0602A …）→ 不臆造正则，靠机构名判定。 */
   ["广银理财", "guangyin"], ["广银", "guangyin"], ["cgbwmc", "guangyin"], ["guangyin", "guangyin"],
+  /* 交银理财（bocommwm.com）：「REQ_MESSAGE=JSON」表单 POST，
+     queryJylcProductDetail.do 拿档案 + queryJylcBreakDetail.do 拿全历史（公开页、免登录）。
+     现金管理类（c_interestway ≠ "0"）只披露万份收益，抓取端明确跳过，不喂净值曲线。
+     ⚠️ 这三条是 2026-10-30 补的：云端早就有 bocom 抓取器和别名，前端这张表漏了，
+     于是「机构栏写交银理财」在前端被判成 chinawealth、抓取就绪提示与实际不符。
+     顺序与云端 ORG_ALIAS 严格一致：广银之后、工银之前。 */
+  ["交银理财", "bocom"], ["交银", "bocom"], ["bocom", "bocom"],
   /* 工银理财（wm.icbc.com.cn）：自研 KitRequest 加密通道（主/工作密钥 + HMAC-MD5 签名 +
      AES-128-CBC 字段加密），走 clt/info/112901 列表 + 112902 明细取净值（2026-09-16 接入）。
      产品代码形态多样（26GS6464 主码 / 26G6464A 销售码）→ 不臆造正则。 */
@@ -64,7 +71,17 @@ export const ORG_ALIAS = [
   ["浙银理财", "czbwm"], ["浙银", "czbwm"], ["czbwm", "czbwm"],
   /* 青银理财（qdccb，2026-10-30 接入）：官网 eportal 只认**青银自营 11 位码**
      （CYCYGG30080），微众货架上的 CCRSFD* 一律 0 条 → 那些产品继续走货架。 */
-  ["青银理财", "qdccb"], ["青银", "qdccb"], ["qdccb", "qdccb"]
+  ["青银理财", "qdccb"], ["青银", "qdccb"], ["qdccb", "qdccb"],
+  /* 光大理财（cebwm，2026-10-30 接入）：官网 cebwm.com 整站在知道创宇「加速乐」
+     后面（连不存在的路径都回 412 + 一段混淆 JS），要过就得执行对方的 JS 绕过访问
+     控制 → 不做。改抓**母公司光大银行**的「光大理财公司产品·最新净值」静态页：
+     匿名、一个请求 99 只、数值与微众货架逐只对得上，但只有最新一条、没有历史
+     （历史由 /eportal 的 getLsjz portlet 出，同样 412）。
+     「光大」短名也收：在光大银行买的用户机构栏常写「光大银行」。
+     ⚠️ 不写 PRODCODE_RULES：光大的 EW + 4 位数字 + 份额字母（EW2999A）与
+     **中国银行代销码**撞形（app.js 链接解析的提示语里那句「中行 EW4455D」就是它），
+     按形态判机构会把中行代销产品错认成光大理财。只按机构名判定。 */
+  ["光大理财", "cebwm"], ["光大", "cebwm"], ["cebwm", "cebwm"]
 ];
 
 /** @type {Readonly<Record<string, string>>} */
@@ -72,8 +89,12 @@ export const ORG_NAME = { bob: "北银理财", hx: "华夏理财", spdb: "浦银
                          nanyin: "南银理财", cmbc: "民生理财", wmbnb: "宁银理财",
                          huiyin: "徽银理财", bocwm: "中银理财", nongyin: "农银理财",
                          hangyin: "杭银理财", xingyin: "兴银理财", guangyin: "广银理财",
-                         icbc: "工银理财", jxwm: "建信理财", cmbwm: "招银理财",
-                         czbwm: "浙银理财", qdccb: "青银理财", chinawealth: "中国理财网" };
+                         icbc: "工银理财", bocom: "交银理财",
+                         jxwm: "建信理财", cmbwm: "招银理财",
+                         czbwm: "浙银理财", qdccb: "青银理财",
+                         /* 前端只显示发行方名，和 jxwm/cmbwm 一样不带渠道后缀
+                            （云端 ORG_NAME 里那条带「光大银行披露页」，用于抓取日志）。 */
+                         cebwm: "光大理财", chinawealth: "中国理财网" };
 
 /**
  * 机构识别：先按别名表（与云端同序），再按「理财」→ 中国理财网，最后按 Z 开头的登记编码兜底。

@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fmtDate } from "../js/core/util.js";
-import { detectOrg, detectOrgByProdCode } from "../js/core/orgs.js";
+import { ORG_ALIAS, ORG_NAME, detectOrg, detectOrgByProdCode } from "../js/core/orgs.js";
 import { navSeries, latestNav, navOnOrBefore, navHit } from "../js/domain/nav.js";
 import { sharesOn, hasAnyTrade, computePosition } from "../js/domain/position.js";
 import { ocrNavLines } from "../js/domain/ocr.js";
@@ -115,6 +115,30 @@ test("机构识别：浙银 / 青银 / 招银（2026-10-30 三家新直连源）
   assert.equal(detectOrgByProdCode("132031D").org, "");
 });
 
+test("机构识别：交银理财（bocom，补前端漏掉的别名）", () => {
+  // 云端早就有 bocom 官网源，前端这张表 2026-10-30 之前漏了 → 同一个产品两边结论不同
+  assert.equal(detectOrg({ inst: "交银理财" }), "bocom");
+  assert.equal(detectOrg({ name: "交银理财纯固收" }), "bocom");
+  assert.equal(ORG_NAME.bocom, "交银理财", "fetchStatus 要认它是直连源（官网+中国理财网双线）");
+  // 「交通银行」不含「交银」，不会被这条别名带走
+  assert.equal(detectOrg({ inst: "交通银行", name: "稳健理财" }), "chinawealth");
+});
+
+test("机构识别：光大理财（cebwm，走母公司光大银行的披露页）", () => {
+  assert.equal(detectOrg({ inst: "光大理财" }), "cebwm");
+  assert.equal(detectOrg({ inst: "光大理财有限责任公司" }), "cebwm");
+  assert.equal(detectOrg({ name: "阳光金日添利1号", manager: "光大理财" }), "cebwm");
+  // 在光大银行买的，机构栏常只写「光大银行」
+  assert.equal(detectOrg({ inst: "光大银行" }), "cebwm");
+  // 别名表按声明顺序匹配：光大银行代销的别家产品仍归发行方，不能被「光大」带走
+  assert.equal(detectOrg({ inst: "光大银行", name: "宁银理财晶瑞固定5号" }), "wmbnb");
+  assert.equal(detectOrg({ inst: "光大银行", name: "徽银理财徽享稳利" }), "huiyin");
+  // EW… 形态故意不写规则：中国银行代销码同为 EW + 4 位数字 + 份额字母（EW4455D），
+  // 按形态判机构会把中行代销的产品错认成光大理财
+  assert.equal(detectOrgByProdCode("EW2999A").org, "");
+  assert.equal(detectOrgByProdCode("EW4455D").org, "");
+});
+
 /* ---- 截图 OCR 的日期/净值配对 ---- */
 test("OCR：日期与净值分处上下两行", () => {
   const rows = ocrNavLines(["净值日期", "2026-10-28", "单位净值", "1.015553", "日涨幅 0.01%"].join("\n"));
@@ -133,4 +157,21 @@ test("OCR：多行记录、中文日期、同行写法", () => {
 test("OCR：两日期小数位不足的数字不误判为净值", () => {
   /* 0.01% 这种两位小数不该被当成净值；没有净值的那一行直接丢弃 */
   assert.deepEqual(ocrNavLines("2026-10-28\n日涨幅 0.01%"), []);
+});
+/* ---- 前后端机构识别一致性（把两边逐字比对，以前只靠人肉核对）----
+   navsources/base.py 在 licai-data 仓库里，Web CI 的检出没有这一份 →
+   文件不在就跳过（本地两边同树，跑得到）。 */
+test("ORG_ALIAS：前端这张表必须与云端逐字同序", async () => {
+  const fs = await import("node:fs");
+  const path = "../navsources/base.py";
+  if (!fs.existsSync(path)) return;              // licai-ledger 单独检出时无此文件
+  const src = fs.readFileSync(path, "utf8");
+  const block = src.split("ORG_ALIAS = {")[1].split("\n}")[0];
+  const py = [...block.matchAll(/^\s*"([^"]+)":\s*"([^"]+)",/gm)].map(m => [m[1], m[2]]);
+  assert.equal(ORG_ALIAS.length, py.length,
+    `云端 ${py.length} 条 / 前端 ${ORG_ALIAS.length} 条，哪家漏了`);
+  for (let i = 0; i < py.length; i++) {
+    assert.deepEqual([...ORG_ALIAS[i]], py[i],
+      `第 ${i + 1} 条不一致（云端 ${py[i]} / 前端 ${ORG_ALIAS[i]}）：别名表按声明顺序命中，顺序也要一致`);
+  }
 });
