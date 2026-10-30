@@ -33,7 +33,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v40";
+const APP_VER = "v41";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -1321,6 +1321,9 @@ function openLinkAdd() {
       <textarea id="lkInput" rows="5" oninput="previewLink()" placeholder="每行一只产品，例如：&#10;https://…?PROD_CODE=YJ01251204A&#10;https://…?prodRegCode=Z7008926000006&#10;ZGN2360006C"
         style="width:100%;padding:11px 12px;border:1.5px solid var(--line);border-radius:11px;font-size:13px;font-family:inherit;color:var(--ink);outline:none;resize:vertical"></textarea>
     </div>
+    <button class="btn gh full" onclick="qrPick()">📱 扫二维码添加（微众分享海报）</button>
+    <input type="file" id="qrFile" accept="image/*" style="display:none" onchange="qrShot(this)">
+    <div class="tip">在微众 App 产品页点「分享」生成海报，截图后在这里选图：二维码里带着该产品的销售代码，本机解开后自动反查发行方并填好机构，图片不上传。</div>
     <div id="lkPreview"></div>
     <div class="field"><label>产品名称 <span class="muted">（可留空，云端抓到后自动补全；多行粘贴时不套用）</span></label>
       <input id="lkName" placeholder="留空即可">
@@ -1911,6 +1914,68 @@ async function ocrShot(pid, input) {
   } catch (e) {
     toast("识别失败：" + String(e.message || e).slice(0, 50), 4200);
   }
+}
+
+/* ============================================================
+   扫微众分享海报上的二维码 → 直接认出产品（App 内）
+   ------------------------------------------------------------
+   微众那三个 `*_no_auth` 接口要 App 注入的设备签名，站外调不通；但产品页
+   「分享」出来的海报二维码是一条**公开短链**：它 302 到官网下载中转页时，
+   跳转参数里就带着这只产品的销售代码（`jumpParam` → base64 → `action_param`）。
+   所以这里只读短链自己吐出来的重定向参数，不碰任何登录态或签名接口。
+   二维码在本机解（ML Kit），代码 → 发行方的反查在包内 Python（公开目录），
+   解出来的代码走「粘贴添加产品」原有那条路，机构名自动填好。
+   ============================================================ */
+const _qrDone = {};
+window.__qrDone = function (id, res) {
+  const f = _qrDone[id]; if (!f) return;
+  delete _qrDone[id]; f(res);
+};
+function qrBridge(b64) {
+  return new Promise(resolve => {
+    if (!window.NativeNav || !window.NativeNav.qr) return resolve({ ok: false, message: "仅 App 内可用" });
+    const id = "q" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const timer = setTimeout(() => { delete _qrDone[id]; resolve({ ok: false, message: "识别超时" }); }, 40000);
+    _qrDone[id] = r => { clearTimeout(timer); resolve(r || { ok: false }); };
+    try { window.NativeNav.qr(id, b64); }
+    catch (e) { clearTimeout(timer); delete _qrDone[id]; resolve({ ok: false, message: String(e) }); }
+  });
+}
+function qrPick() {
+  if (!window.NativeNav || !window.NativeNav.qr) return toast("扫码添加只在 App 内可用；网页版请直接粘贴产品代码", 4200);
+  const el = $("qrFile"); if (!el) return;
+  try { el.value = ""; } catch (e) { }
+  el.click();
+}
+/* 二维码比整页文字吃分辨率：压太狠就解不出，这里留到 2000 */
+async function qrShot(input) {
+  const f = input && input.files && input.files[0];
+  if (!f) return;
+  toast("扫码中…（本机识别，图片不上传）", 2600);
+  try {
+    const b64 = await fileToJpegBase64(f, 2000);
+    const r = await qrBridge(b64);
+    if (!r || !r.ok) return toast((r && r.message) || "识别失败", 4200);
+    const d = r.data || {};
+    if (!d.ok || !d.code) return toast(d.message || "二维码里不是微众的产品页", 5200);
+    applyQrProduct(d);
+  } catch (e) {
+    toast("识别失败：" + String(e.message || e).slice(0, 50), 4200);
+  }
+}
+/* 解出来的代码塞进上面的粘贴框，机构用发行方全名兜底 —— 云端靠 inst 选数据源 */
+function applyQrProduct(d) {
+  const box = $("lkInput"); if (!box) return;
+  const line = String(d.code).toUpperCase();
+  const old = box.value.trim();
+  if (old.split(/\r?\n/).some(x => x.trim().toUpperCase() === line)) {
+    return toast(line + " 已经在列表里了", 3600);
+  }
+  box.value = (old ? old + "\n" : "") + line;
+  const inst = $("lkInst");
+  if (inst && d.orgName && !inst.value.trim()) inst.value = d.orgName;
+  previewLink();
+  toast(`认出 ${d.name || line}${d.orgName ? " · " + d.orgName : ""}`, 4600);
 }
 
 function openNav(pid) {
@@ -3153,7 +3218,7 @@ Object.assign(window, {
   addNav, aixhubCheckNow, aixhubLoginFlow, aixhubLogout, autoFillNav, bulkNav, calcShares, calMove, clearAll,
   clearDetSearch, closeSheet, commitNav, delNav, delProd, delTrade, dismissAlert, editProd,
   exportJSON, go, importJSON, ledgermeCheckNow, ledgermeLoginFlow, ledgermeLogout, ocrPick, ocrShot, onDetSearch, onProdCodeInput, onTradeDateChange, openLinkAdd,
-  openNav, openProd, openProdDetail, openSync, openTrade, pickDay, pickProduct, previewLink,
+  openNav, openProd, openProdDetail, openSync, openTrade, pickDay, pickProduct, previewLink, qrPick, qrShot,
   queryProduct, refreshNav, renderPick, renderTradeForm2, resetManualFetch, saveFromLink,
   saveProduct, saveSyncCfg, saveTrade, setDetInst, setDetSort, setDetTab, setGroup, setProdOv,
   setProdRange, setRange, syncPull, syncPush, toggleHide, toggleNotify, triggerFetch
