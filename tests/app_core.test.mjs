@@ -279,3 +279,90 @@ test("ORG_ALIAS：前端这张表必须与云端逐字同序", async () => {
       `第 ${i + 1} 条不一致（云端 ${py[i]} / 前端 ${ORG_ALIAS[i]}）：别名表按声明顺序命中，顺序也要一致`);
   }
 });
+
+/* ---- 「隐藏」开关的源码级门禁（v45）----
+   这一组不测算法，测的是「有没有绕过唯一出口」。
+   隐藏金额是给用户当别人面打开 App 用的，漏遮一处就不是不好看而是事故；
+   而漏遮只在 hideAmount=true 时看得见，人肉回归基本抓不住。
+   口径：金额文本一律 shown()，涨跌色一律 tone()，两个 helper 是唯一出口。 */
+const APP_SRC = await (async () => {
+  const fs = await import("node:fs");
+  return fs.readFileSync(new URL("../app.js", import.meta.url), "utf8");
+})();
+/* 从函数名切出函数体（到下一个顶层 \nfunction 为止；本仓的渲染函数都是顶层声明） */
+function fnBody(name) {
+  const i = APP_SRC.indexOf(`function ${name}(`);
+  assert.ok(i > 0, `app.js 里找不到 ${name}()`);
+  const j = APP_SRC.indexOf("\nfunction ", i + 1);
+  return APP_SRC.slice(i, j < 0 ? APP_SRC.length : j);
+}
+/* shown( 的覆盖区间：括号配对算出来的，比"前一个 token 是 shown"可靠 ——
+   shown(isMoney ? signMoney(v) : ...) 这种三元参数、shown((Number(x)||0).toFixed(2))
+   这种嵌套括号，用正则前窥都会看漏。 */
+function shownSpans(src) {
+  const spans = [];
+  for (let i = src.indexOf("shown("); i >= 0; i = src.indexOf("shown(", i + 1)) {
+    let depth = 0;
+    for (let j = i + 5; j < src.length; j++) {
+      if (src[j] === "(") depth++;
+      else if (src[j] === ")") { depth--; if (depth === 0) { spans.push([i, j]); break; } }
+    }
+  }
+  return spans;
+}
+const SPANS = shownSpans(APP_SRC);
+const inSpan = (idx, offset = 0) => SPANS.some(([a, b]) => idx + offset > a && idx + offset < b);
+const TONE_FN = ["renderHome", "setStat", "renderCal", "pendingHtml", "closedHtml",
+  "renderDetailBody", "renderTrade", "renderProd"];
+/* 个人数字的遮蔽面：金额 + 份额。份额两位小数，6.9 万份就是 6.9 万元，
+   遮了金额不遮份额等于没遮；净值 / 成本净值是四位小数的公开或衍生口径，不在此列。 */
+const MASK_FN = [...TONE_FN, "renderProdDetail"];
+
+test("隐藏：app.js 里不许再手写「隐藏时输出星号」的三元式", () => {
+  const hits = APP_SRC.match(/hideAmount\s*\?\s*["'`]\*{2,}["'`]/g) || [];
+  assert.deepEqual(hits, [],
+    `手写遮蔽绕过了 shown()：${hits.join(", ")}\n请改成 shown(文本) / tone(数值)`);
+});
+
+test("隐藏：所有 money() / signMoney() 调用都在 shown() 括号内", () => {
+  /* 例外只有一条：录入交易时的实时试算。用户正在填份额/金额，遮了就没法录。
+     要扩大例外必须改这条测试，逼人来想一次「这里该不该遮」。 */
+  const ALLOW = ["tAmountShow"];
+  const lines = APP_SRC.split("\n");
+  const bad = [];
+  const re = /\b(money|signMoney)\s*\(/g;
+  let m;
+  while ((m = re.exec(APP_SRC))) {
+    const ln = APP_SRC.slice(0, m.index).split("\n").length - 1;
+    if (ALLOW.some(k => lines[ln].includes(k))) continue;
+    if (!inSpan(m.index)) bad.push(`${ln + 1}: ${lines[ln].trim().slice(0, 80)}`);
+  }
+  assert.deepEqual(bad, [],
+    `这些金额格式化没走 shown()，隐藏开关打开时会明文显示：\n  ${bad.join("\n  ")}`);
+});
+
+test("隐藏：渲染函数不许用裸 cls()，份额不许裸 toFixed(2)", () => {
+  for (const n of TONE_FN) {
+    const b = fnBody(n);
+    const bare = b.match(/[^.\w]cls\(/g) || [];
+    assert.equal(bare.length, 0,
+      `${n}() 有 ${bare.length} 处裸 cls()：隐藏时颜色泄露正负，请改 tone()`);
+    assert.ok(b.includes("shown("), `${n}() 里没有任何 shown()：金额遮蔽疑似被删`);
+  }
+  for (const n of MASK_FN) {
+    const b = fnBody(n);
+    const off = APP_SRC.indexOf(b);
+    const leak = [];
+    const re = /\.toFixed\(2\)/g;
+    let m;
+    while ((m = re.exec(b))) if (!inSpan(off + m.index)) leak.push(b.slice(Math.max(0, m.index - 40), m.index + 14).trim());
+    assert.deepEqual(leak, [],
+      `${n}() 有 ${leak.length} 处裸 .toFixed(2)：份额是钱的另一种写法，隐藏时必须走 shown()`);
+  }
+});
+
+test("隐藏：产品收益表只放公开披露口径（不该出现金额列）", () => {
+  const b = fnBody("renderBoard");
+  assert.ok(b.includes("BOARD_COLS"), "renderBoard() 不再引用 BOARD_COLS：表头口径失控");
+  assert.ok(!/\bmoney\(/.test(b), "renderBoard() 出现金额格式化：公开口径表不该有金额");
+});

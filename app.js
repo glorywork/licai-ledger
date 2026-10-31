@@ -10,7 +10,8 @@
    所以下面的代码可以照旧按任意顺序引用它们。
    注意：ES module 的顶层声明**不再**自动挂到 window 上 ——
    内联 onclick 需要的那批入口在文件末尾统一 Object.assign 回 window。 */
-import { $, pad, fmtDate, parseDate, today, money, signMoney, pct, cls, uid, esc, toast, dayDiff }
+import { $, pad, fmtDate, parseDate, today, money, signMoney, pct, cls, uid, esc, toast, dayDiff,
+  maskMoney, maskTone }
   from "./js/core/util.js";
 import { ORG_NAME, detectOrg, detectOrgByProdCode, prodCodeOf, fetchStatus }
   from "./js/core/orgs.js";
@@ -22,6 +23,8 @@ import { ocrNavLines } from "./js/domain/ocr.js";
 import { configureCalendar, suggestTradeDates, tradeDaysBetween } from "./js/domain/calendar.js";
 import { normTomb, mergeTombs, purgeTombs, applyTombs as applyTombsIn } from "./js/domain/tomb.js";
 import { mergeForPush } from "./js/domain/sync.js";
+import { BOARD_COLS, NO_INST, instKey, instLabel, boardFilter, boardInstChips,
+  monthZeroDays, boardSort } from "./js/domain/board.js";
 
 /* ---------- 常量 ---------- */
 const LS_DATA = "licai_ledger_v1";
@@ -35,7 +38,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v44";
+const APP_VER = "v45";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -97,7 +100,20 @@ let SYNC = { owner: "", repo: "", path: "licai-data.json", token: "", sha: "", a
 let NOTIFY = { on: false, lastCheck: 0 };
 /* 用户已忽略的抓取告警签名（按「失败集合」生成，集合一变就重新提示） */
 let ALERT_DISMISSED = "";
-let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7", detQ: "", detInst: "", detSort: "dayP", detAsc: false };
+let UI = { range: "day", groupBy: "inst", calY: 0, calM: 0, selDate: "", activePick: "", viewProd: "", detTab: "active", prodRange: "3m", prodOv: "a7", detQ: "", detInst: "", detSort: "dayP", detAsc: false,
+  /* 产品页收益表：机构筛选 / 搜索 / 排序列与方向（默认按持有天数降序） */
+  bdQ: "", bdInst: "", bdSort: "holdDays", bdAsc: false };
+
+/* ---------- 「隐藏」开关的两个唯一出口 ----------
+   以前各处手写「隐藏时输出四个星」的三元式，写漏一处就等于没遮：
+   台账页的日收益大字、日历格子里的当日收益、明细里的当日盈亏都漏过。
+   现在渲染里凡是金额 / 收益类数值一律走 shown()，涨跌色一律走 tone()
+   （颜色会泄露正负，只遮数字不遮颜色等于没遮）。app_core.test.mjs 有一条
+   源码级门禁盯着这几个渲染函数，新增字段忘了遮会直接把 CI 跑红。 */
+/** @param {string} text 已格式化的显示文本 */
+function shown(text) { return maskMoney(DATA.settings.hideAmount, text); }
+/** @param {number} v 决定涨跌色的数值 */
+function tone(v) { return maskTone(DATA.settings.hideAmount, v); }
 
 /* ---------- 持久化 ---------- */
 /* （workdaysBetween 已删除：定义后从未被调用，且容易让人误以为 T+1 用工作日口径 —— 2026-09-15 审查清理） */
@@ -446,7 +462,7 @@ function annualize(profit, y, m) {
    ============================================================ */
 function renderHome() {
   const pf = portfolio();
-  $("totalAsset").textContent = DATA.settings.hideAmount ? "****" : money(pf.totalAsset);
+  $("totalAsset").textContent = shown(money(pf.totalAsset));
   $("tradeHint").textContent = `共 ${DATA.trades.length} 笔交易 · ${pf.rows.length} 只持仓`
     + (pf.pendingRows.length ? ` · ${pf.pendingRows.length} 只在途` : "");
   /* 今日/区间收益 */
@@ -468,8 +484,12 @@ function renderHome() {
   } else { val = monthProfit(y, m); lab = "本月收益"; }
   const rate = pf.totalAsset > 0 ? val / pf.totalAsset : 0;
   const big = $("sumBig");
-  big.textContent = signMoney(val); big.className = "big " + cls(val);
-  $("sumRate").textContent = `(${val >= 0 ? "+" : ""}${pct(rate)})`; $("sumRate").className = "rate " + cls(val);
+  /* v45：隐藏开关必须盖住这里。以前只遮「持有资产」，日收益大字与百分比、
+     月度年化、日历格子数字全是明晃晃的 —— 「隐藏」按下去只藏了一只角。
+     颜色也一起收（tone），否则一片绿照样暴露今天赚没赚。 */
+  big.textContent = shown(signMoney(val)); big.className = "big " + tone(val);
+  $("sumRate").textContent = shown(`(${val >= 0 ? "+" : ""}${pct(rate)})`);
+  $("sumRate").className = "rate " + tone(val);
   const ldAll = latestDateAll();
   $("sumDate").textContent = `${lab} · ${ldAll || today()}`
     + (UI.range === "day" ? (ldAll === today() ? " · 已全部更新" : " · 今日暂未披露") : "");
@@ -488,8 +508,9 @@ function renderHome() {
 }
 function setStat(id, v, isMoney, isPct) {
   const e = $(id);
-  if (isMoney) { e.textContent = DATA.settings.hideAmount ? "****" : signMoney(v); e.className = "v " + cls(v); }
-  else { e.textContent = (v >= 0 ? "+" : "") + pct(v); e.className = "v " + cls(v); }
+  /* 金额与百分比（年化）都算收益类数值：隐藏时一起遮，颜色一起收 */
+  e.textContent = shown(isMoney ? signMoney(v) : (v >= 0 ? "+" : "") + pct(v));
+  e.className = "v " + tone(v);
 }
 function latestDateAll() {
   let d = "";
@@ -527,11 +548,12 @@ function renderCal() {
     const isUnd = !!undis[dd];
     const selc = (UI.selDate === ds) ? " sel" : "";
     const todayc = (ds === tds) ? " today" : "";
-    const negc = (has && v < 0) ? " neg" : "";
+    /* v45：隐藏时不给负收益上红色 —— 颜色本身就是「今天亏了」的信息 */
+    const negc = (has && !DATA.settings.hideAmount && v < 0) ? " neg" : "";
     const undiscls = isUnd ? " undis" : "";
     h += `<div class="d${has ? " has" : ""}${negc}${undiscls}${selc}${todayc}" ${has ? `onclick="pickDay('${ds}')"` : ""}>
             <span class="dd">${dd}</span>
-            ${has ? `<span class="val">${signMoney(v)}</span>` : (isUnd ? `<span class="und">未披露</span>` : "")}
+            ${has ? `<span class="val">${shown(signMoney(v))}</span>` : (isUnd ? `<span class="und">未披露</span>` : "")}
           </div>`;
   }
   $("calGrid").innerHTML = h;
@@ -613,8 +635,8 @@ function pendingHtml(list) {
       <div class="pn">${esc(p.inst || "")}</div>
       <div class="pv muted">-</div>
       <div class="pk">
-        <i>在途金额 <b>${DATA.settings.hideAmount ? "****" : money(pos.pendingAmount)}</b></i>
-        <i>预估份额 <b>${pos.pendingShares.toFixed(2)}</b></i>
+        <i>在途金额 <b>${shown(money(pos.pendingAmount))}</b></i>
+        <i>预估份额 <b>${shown(pos.pendingShares.toFixed(2))}</b></i>
         <i>市值 <b class="muted">-</b></i>
         <i>持仓收益 <b class="muted">-</b></i>
         <i>确认后自动计入持仓</i>
@@ -630,11 +652,11 @@ function closedHtml(list) {
     <div class="grp-h">
       <div class="av">${esc(String(p.inst || p.name || "?").slice(0, 1))}</div>
       <div class="nm">${esc(prodLabel(p))}<span class="state-chip closed">已清仓</span></div>
-      <div class="amt ${cls(pos.realized)}">${signMoney(pos.realized)}</div>
+      <div class="amt ${tone(pos.realized)}">${shown(signMoney(pos.realized))}</div>
     </div>
     <div class="prow">
       <div class="pn">已实现收益</div>
-      <div class="pv ${cls(pos.realized)}">${signMoney(pos.realized)}</div>
+      <div class="pv ${tone(pos.realized)}">${shown(signMoney(pos.realized))}</div>
       <div class="pk">
         <i>已核算赎回 <b>${n} 笔</b></i>
         <i>持仓份额 <b>0.00</b></i>
@@ -759,23 +781,25 @@ function renderDetailBody() {
   for (const k of Object.keys(groups)) {
     const arr = groups[k];
     const sum = arr.reduce((s, x) => s + x.dayP, 0);
+    /* v45：这一屏原来是隐藏开关的死角 —— 分组行、每只产品的当日盈亏 / 持仓盈亏 /
+       持有金额全部明文。改成一律走 shown() + tone()，颜色口径与首页一致。 */
     html += `<div class="grp">
       <div class="grp-h">
         <div class="av">${esc(k.slice(0, 1))}</div>
         <div class="nm">${esc(k)}<span class="wr"> ${arr.length} 只</span></div>
-        <div class="amt ${cls(sum)}">${signMoney(sum)} <span class="wr">万收(${sum !== 0 ? (sum / Math.max(arr.reduce((s, x) => s + x.pos.market, 0), 1) * 10000).toFixed(2) : "0.00"})</span></div>
+        <div class="amt ${tone(sum)}">${shown(signMoney(sum))} <span class="wr">万收(${shown(sum !== 0 ? (sum / Math.max(arr.reduce((s, x) => s + x.pos.market, 0), 1) * 10000).toFixed(2) : "0.00")})</span></div>
       </div>`;
     for (const x of arr) {
       const annualTxt = x.pos.annualValid
-        ? `<b class="${cls(x.pos.holdAnnual)}">${pct(x.pos.holdAnnual)}</b>`
+        ? `<b class="${tone(x.pos.holdAnnual)}">${shown(pct(x.pos.holdAnnual))}</b>`
         : `<b class="muted">持有不足7天</b>`;
       html += `<div class="prow">
         <div class="pn"><button class="link" onclick="openProdDetail('${x.r.p.id}')">${esc(prodLabel(x.r.p))}</button></div>
-        <div class="pv ${cls(x.dayP)}">${signMoney(x.dayP)}</div>
+        <div class="pv ${tone(x.dayP)}">${shown(signMoney(x.dayP))}</div>
         <div class="pk">
-          <i>持有金额 <b>${DATA.settings.hideAmount ? "****" : money(x.pos.market)}</b></i>
-          <i>当日盈亏 <b class="${cls(x.dayP)}">${signMoney(x.dayP)}</b></i>
-          <i>持仓盈亏 <b class="${cls(x.pos.profit)}">${signMoney(x.pos.profit)}</b>（市值−成本）</i>
+          <i>持有金额 <b>${shown(money(x.pos.market))}</b></i>
+          <i>当日盈亏 <b class="${tone(x.dayP)}">${shown(signMoney(x.dayP))}</b></i>
+          <i>持仓盈亏 <b class="${tone(x.pos.profit)}">${shown(signMoney(x.pos.profit))}</b>（市值−成本）</i>
           <i>持有年化 ${annualTxt}（本金天数加权）</i>
           <i>持有 <b>${x.pos.holdDays}天</b></i>
           <i>净值 <b>${x.pos.lastNav.toFixed(4)}</b>${x.pos.lastDate ? "（" + esc(x.pos.lastDate.slice(5)) + "）" : ""}</i>
@@ -803,12 +827,12 @@ function renderTrade() {
             <span class="wr" style="font-size:10.5px;padding:2px 6px;border-radius:5px;background:${isBuy ? '#e9f7f1' : '#fdeff0'};color:${isBuy ? '#0d7a52' : '#c02a34'};margin-left:4px">${isBuy ? "买入" : "赎回"}</span>
           </div>
           <div style="font-size:11px;color:var(--ink2);margin-top:3px">
-            ${t.tradeDate} · 确认 ${t.confirmNavDate || "-"} · 净值 ${Number(t.confirmNav || 0).toFixed(4)} · ${(Number(t.shares) || 0).toFixed(2)}份
+            ${t.tradeDate} · 确认 ${t.confirmNavDate || "-"} · 净值 ${Number(t.confirmNav || 0).toFixed(4)} · ${shown((Number(t.shares) || 0).toFixed(2))}份
           </div>
         </div>
         <div style="text-align:right">
-          <div style="font-weight:700;font-size:13px">${isBuy ? "-" : "+"}${money(t.amount)}</div>
-          ${t.realized ? `<div style="font-size:11px" class="${cls(t.realized)}">实现 ${signMoney(t.realized)}</div>` : ""}
+          <div style="font-weight:700;font-size:13px">${isBuy ? "-" : "+"}${shown(money(t.amount))}</div>
+          ${t.realized ? `<div style="font-size:11px" class="${tone(t.realized)}">实现 ${shown(signMoney(t.realized))}</div>` : ""}
           <button class="mini" style="margin-top:4px;padding:2px 8px;font-size:10.5px" onclick="delTrade('${t.id}')">删除</button>
         </div>
       </div>`;
@@ -822,8 +846,8 @@ function renderTrade() {
     $("realList").innerHTML = sells.map(t => {
       const p = DATA.products.find(x => x.id === t.prodId);
       return `<div class="sumline"><span class="k">${esc(p ? prodLabel(p) : "-")} <span class="muted" style="font-size:11px">${t.tradeDate}</span></span>
-        <b class="${cls(t.realized)}">${signMoney(t.realized)}</b></div>`;
-    }).join("") + `<div class="sumline"><span class="k">合计已实现 <span class="muted" style="font-size:10.5px">均价法扣减成本 · 已核算 ${sells.length} 笔赎回</span></span><b class="${cls(tot)}">${signMoney(tot)}</b></div>`;
+        <b class="${tone(t.realized)}">${shown(signMoney(t.realized))}</b></div>`;
+    }).join("") + `<div class="sumline"><span class="k">合计已实现 <span class="muted" style="font-size:10.5px">均价法扣减成本 · 已核算 ${sells.length} 笔赎回</span></span><b class="${tone(tot)}">${shown(signMoney(tot))}</b></div>`;
   }
 }
 
@@ -840,7 +864,7 @@ function renderProd() {
         <div class="p2">登记编码 ${esc(p.code || "-")} · 产品代码 <b>${esc(p.prodCode || "-")}</b></div>
         <div class="p2" style="color:${st.ok ? "#0d7a52" : "#8a6300"}">${st.txt}</div>
         ${stale ? `<div class="p2" style="color:#8a6300">⏳ 净值停在 ${esc(stale.date)}，此后已过 ${stale.lag} 个交易日未更新</div>` : ""}
-        <div class="p3">份额 ${pos.shares.toFixed(2)} · 成本 ${money(pos.cost)} · 市值 ${money(pos.market)} · 浮盈 <b class="${cls(pos.profit)}">${signMoney(pos.profit)}</b> · 净值 ${l ? l[1].toFixed(4) + " (" + l[0] + ")" : "无数据"}</div>
+        <div class="p3">份额 ${shown(pos.shares.toFixed(2))} · 成本 ${shown(money(pos.cost))} · 市值 ${shown(money(pos.market))} · 浮盈 <b class="${tone(pos.profit)}">${shown(signMoney(pos.profit))}</b> · 净值 ${l ? l[1].toFixed(4) + " (" + l[0] + ")" : "无数据"}</div>
         <div class="row-btn" style="margin-top:8px">
           <button class="mini" onclick="openProdDetail('${p.id}')">详情</button>
           <button class="mini" onclick="editProd('${p.id}')">编辑</button>
@@ -858,6 +882,104 @@ function renderProd() {
       ${recent.length ? recent.map(([d, v]) => `<span style="display:inline-block;font-size:11px;background:var(--bg);border-radius:6px;padding:3px 8px;margin:0 5px 5px 0">${d.slice(5)} <b>${Number(v).toFixed(4)}</b></span>`).join("") : `<span class="muted" style="font-size:11px">暂无净值</span>`}
     </div>`;
   }).join("") || `<div class="empty">暂无产品</div>`;
+  /* 产品收益表（pg-prod）与产品列表共用同一批数据。任何改动产品的入口
+     （添加 / 编辑 / 删除 / 补录净值 / 抓取）都会调 renderProd()，
+     顺带刷一次表 —— 否则在详情弹层里抓完净值、关掉后表还是旧数字。 */
+  renderBoard();
+}
+
+/* ---------- 产品页：收益对比表（v45 新增） ---------- */
+/* 一行一个产品。指标全部来自公用的 navStats()/position()，
+   算法（筛选 / 排序 / 月挂 0）在 js/domain/board.js 里，可单测。 */
+function boardRows() {
+  const ym = today().slice(0, 7);
+  return DATA.products.map(p => {
+    const pos = position(p);
+    const st = navStats(p);
+    return {
+      id: String(p.id),
+      name: prodLabel(p),
+      inst: p.inst || "",
+      ikey: instKey(p.inst),
+      code: p.code || "",
+      prodCode: p.prodCode || "",
+      holdDays: pos.holdDays,
+      lastDate: st.dates.length ? st.dates[st.dates.length - 1] : "",
+      /* null = 没有可比的前值 / 样本不足，渲染成「—」，排序永远垫底 */
+      wan: lastNum(st.wan),
+      a7: lastNum(st.a7),
+      a14: lastNum(st.a14),
+      a30: lastNum(st.a30),
+      zero: monthZeroDays(st.dates, st.wan, ym),
+    };
+  });
+}
+/** 万收：4 位小数。2 位会把 0.45 和 0.48 显示成同一个数，表就白排了 */
+const wan4 = (v) => (v === null ? "—" : v.toFixed(4));
+/** 年化：与详情页 pctFmt 同口径，null 显示「—」 */
+const pct4 = (v) => (v === null ? "—" : `${v >= 0 ? "+" : ""}${pct(v)}`);
+
+function renderBoard() {
+  const tbl = $("boardTbl");
+  if (!tbl) return;
+  const all = boardRows();
+  const total = all.length;
+  const list = boardSort(boardFilter(all, UI.bdInst, UI.bdQ), UI.bdSort, UI.bdAsc);
+
+  /* 机构 chips：只有一个机构时不占地方（与明细页同一取舍） */
+  if ($("bdInstChips")) {
+    const chips = boardInstChips(all);
+    $("bdInstChips").innerHTML = chips.length < 2 ? ""
+      : `<button class="chip${UI.bdInst === "" ? " on" : ""}" onclick="setBdInst('')">全部 ${total}</button>`
+        + chips.map(c => `<button class="chip${UI.bdInst === c.key ? " on" : ""}" onclick="setBdInst(${JSON.stringify(c.key).replace(/"/g, "&quot;")})">${esc(instShort(instLabel(c.key)))} ${c.n}</button>`).join("");
+    /* 选中的机构这一轮没了（例如产品被删）→ 回到「全部」，避免整页空白 */
+    if (UI.bdInst && !chips.some(c => c.key === UI.bdInst)) { UI.bdInst = ""; renderBoard(); return; }
+  }
+  if ($("bdCount")) $("bdCount").textContent = total ? `共 ${total} 只 · 显示 ${list.length}` : "共 0 只";
+
+  const sortMark = (k) => (UI.bdSort === k ? (UI.bdAsc ? " ↑" : " ↓") : "");
+  const head = BOARD_COLS.map(([k, lab, tip]) =>
+    `<th class="srt" title="${esc(tip)}" onclick="setBdSort('${k}')">${esc(lab)}${sortMark(k)}</th>`).join("");
+
+  if (!total) {
+    tbl.innerHTML = "";
+    if ($("bdNote")) $("bdNote").innerHTML = `<div class="empty">还没有产品。到「交易」页点「+ 添加产品」按登记编码查询。</div>`;
+    return;
+  }
+  if (!list.length) {
+    tbl.innerHTML = "";
+    if ($("bdNote")) $("bdNote").innerHTML = `<div class="empty">没有匹配的产品，点「清除」重置筛选</div>`;
+    return;
+  }
+  /* 金额类一列都没有，所以这张表不需要走 shown() 遮蔽：
+     万收与年化是产品公开披露口径，持有天数与挂零天数不含金额信息。 */
+  tbl.innerHTML = `<thead><tr>${head}</tr></thead><tbody>`
+    + list.map(r => `<tr>
+        <td class="nm"><button class="link" onclick="openProdDetail('${r.id}')">${esc(r.name)}</button></td>
+        <td>${r.holdDays}</td>
+        <td class="${cls(r.wan === null ? 0 : r.wan)}">${wan4(r.wan)}</td>
+        <td class="${cls(r.a7 === null ? 0 : r.a7)}">${pct4(r.a7)}</td>
+        <td class="${cls(r.a14 === null ? 0 : r.a14)}">${pct4(r.a14)}</td>
+        <td class="${cls(r.a30 === null ? 0 : r.a30)}">${pct4(r.a30)}</td>
+        <td class="${r.zero ? "warn-n" : "muted"}">${r.zero}</td>
+      </tr>`).join("")
+    + `</tbody>`;
+  if ($("bdNote")) {
+    const ld = list.reduce((m, r) => (r.lastDate > m ? r.lastDate : m), "");
+    $("bdNote").innerHTML = `<span class="muted">数据截至 ${esc(ld || "—")}</span>`;
+  }
+}
+function setBdInst(k) { UI.bdInst = (UI.bdInst === k && k !== "") ? "" : k; renderBoard(); }
+function setBdSort(k) {
+  if (UI.bdSort === k) UI.bdAsc = !UI.bdAsc;
+  else { UI.bdSort = k; UI.bdAsc = k === "name" || k === "zero"; }
+  renderBoard();
+}
+function onBdSearch() { UI.bdQ = $("bdSearch") ? $("bdSearch").value : ""; renderBoard(); }
+function clearBdSearch() {
+  UI.bdQ = ""; UI.bdInst = "";
+  if ($("bdSearch")) $("bdSearch").value = "";
+  renderBoard();
 }
 
 /* ---------- 设置页同步状态 ---------- */
@@ -886,8 +1008,10 @@ function go(pid) {
   $(pid).classList.add("on");
   document.querySelectorAll(".tabbar .tb").forEach(b => b.classList.toggle("on", b.dataset.p === pid));
   window.scrollTo(0, 0);
-  if (pid === "pg-trade") renderTrade();
-  if (pid === "pg-prod") renderProd();
+  /* v45：原「产品」页的两张卡片整体搬到「交易」页，所以进交易页要把产品列表
+     一起渲染（renderProd 内部会顺带刷产品收益表）；「产品」页只剩收益对比表。 */
+  if (pid === "pg-trade") { renderTrade(); renderProd(); }
+  if (pid === "pg-prod") renderBoard();
   if (pid === "pg-set") renderSet();
 }
 function setRange(btn) {
@@ -1109,7 +1233,7 @@ function prodForm(pid) {
       <div class="tip">发行方（如「广银理财」「北银理财」）或完整产品名含「理财」即可自动识别；代销银行（微众/招行等）不影响，识别依据是发行方与产品名</div>
     </div>
     ${meta}
-    <div class="note" style="margin-bottom:12px">历史净值可不填，保存后由云端抓取自动补全；也可在「产品」页用「录入/查看净值」手工补录。</div>
+    <div class="note" style="margin-bottom:12px">历史净值可不填，保存后由云端抓取自动补全；也可在「交易」页用「录入/查看净值」手工补录。</div>
     <div class="row-btn">
       <button class="btn gh" style="flex:1" onclick="closeSheet()">取消</button>
       <button class="btn pri" style="flex:1" onclick="saveProduct('${pid || ""}')">${p ? "保存修改" : "保存产品"}</button>
@@ -1635,7 +1759,7 @@ function renderProdDetail() {
 
     <div class="grid2" style="margin-top:12px">
       <div class="stat"><div class="l">最新净值${latestDate ? "（" + esc(latestDate.slice(5)) + "）" : ""}</div><div class="v" style="color:var(--brand)">${navFmt(latest)}</div><div class="cap">官方披露的份额净值</div></div>
-      <div class="stat"><div class="l">万份收益（最新）</div><div class="v ${cls(wan === null ? 0 : wan)}">${wan === null ? "—" : signMoney(wan)}</div><div class="cap">(今 − 昨) × 10000</div></div>
+      <div class="stat"><div class="l">万份收益（最新）</div><div class="v ${cls(wan === null ? 0 : wan)}">${wan4(wan)}</div><div class="cap">(今 − 昨) × 10000 · 元/万份</div></div>
       <div class="stat"><div class="l">近7日年化</div><div class="v ${cls(a7 === null ? 0 : a7)}">${pctFmt(a7)}</div><div class="cap">7 日净值变动折算年化</div></div>
       <div class="stat"><div class="l">近14日年化</div><div class="v ${cls(a14 === null ? 0 : a14)}">${pctFmt(a14)}</div><div class="cap">14 日折算</div></div>
       <div class="stat"><div class="l">近1月年化</div><div class="v ${cls(a30 === null ? 0 : a30)}">${pctFmt(a30)}</div><div class="cap">30 日折算</div></div>
@@ -1652,10 +1776,10 @@ function renderProdDetail() {
 
     ${pos.shares > 0 ? `<div class="card-t" style="margin:14px 0 8px"><h2 style="font-size:14px">我的持仓</h2></div>
     <div class="grid2">
-      <div class="stat"><div class="l">持有金额</div><div class="v">${DATA.settings.hideAmount ? "****" : money(pos.market)}</div><div class="cap">已确认份额 × 最新净值</div></div>
-      <div class="stat"><div class="l">持仓收益</div><div class="v ${cls(pos.profit)}">${signMoney(pos.profit)}</div><div class="cap">市值 − 持仓成本</div></div>
-      <div class="stat"><div class="l">持仓份额</div><div class="v" style="font-size:15px">${pos.shares.toFixed(2)}</div><div class="cap">已确认份额，不含在途</div></div>
-      <div class="stat"><div class="l">成本净值</div><div class="v" style="font-size:15px">${pos.shares > 0 ? (pos.cost / pos.shares).toFixed(4) : "—"}</div><div class="cap">买入金额合计 ÷ 份额</div></div>
+      <div class="stat"><div class="l">持有金额</div><div class="v">${shown(money(pos.market))}</div><div class="cap">已确认份额 × 最新净值</div></div>
+      <div class="stat"><div class="l">持仓收益</div><div class="v ${tone(pos.profit)}">${shown(signMoney(pos.profit))}</div><div class="cap">市值 − 持仓成本</div></div>
+      <div class="stat"><div class="l">持仓份额</div><div class="v" style="font-size:15px">${shown(pos.shares.toFixed(2))}</div><div class="cap">已确认份额，不含在途</div></div>
+      <div class="stat"><div class="l">成本净值</div><div class="v" style="font-size:15px">${pos.shares > 0 ? shown((pos.cost / pos.shares).toFixed(4)) : "—"}</div><div class="cap">买入金额合计 ÷ 份额</div></div>
     </div>` : ""}
 
     <div class="card-t" style="margin:16px 0 8px"><h2 style="font-size:14px">净值走势</h2></div>
@@ -2125,10 +2249,10 @@ function refreshNav() {
       <div id="manFetchBox">${manStatusHtml()}</div>
     </div>
     <div class="field"><label>各产品抓取就绪状态（${ready} / ${DATA.products.length} 可自动抓取）</label>
-      <div>${rows}<div class="tip" style="margin-top:6px">判定口径与云端抓取脚本一致：<b>机构可识别</b> + <b>已填产品代码</b>。标 ⚠️ 的产品请到「产品」页点「编辑」补填。</div></div>
+      <div>${rows}<div class="tip" style="margin-top:6px">判定口径与云端抓取脚本一致：<b>机构可识别</b> + <b>已填产品代码</b>。标 ⚠️ 的产品请到「交易」页的产品列表点「编辑」补填。</div></div>
     </div>
     <div class="row-btn" style="margin-top:14px">
-      <button class="btn gh" style="flex:1" onclick="closeSheet();go('pg-prod')">去产品页</button>
+      <button class="btn gh" style="flex:1" onclick="closeSheet();go('pg-trade')">去交易页管理产品</button>
     </div>`);
   ensureManualPolling();   /* 上次手动抓取还在跑就接着追踪 */
 }
@@ -2658,7 +2782,7 @@ async function nativeFetchAll(forceExtra) {
   if (_nativeBusy) return;
   /* 本机抓取不依赖 GitHub：没配同步也能抓、能落盘；配了才会在抓到新净值后自动推送 */
   const list = DATA.products.filter(p => fetchStatus(p).ok);
-  if (!list.length) { toast("没有可抓取的产品：请先在产品页补填产品代码或登记编码"); return; }
+  if (!list.length) { toast("没有可抓取的产品：请先在「交易」页的产品列表补填产品代码或登记编码"); return; }
   _nativeBusy = true;
   /* 手动抓取前先确认秒讯登录态：过期就提前跳过，别等每只产品都撞一次 401。 */
   if (forceExtra && aixhubToken()) await aixhubCheck(true);
@@ -3152,11 +3276,11 @@ function clearAll() {
    tests/handlers.test.mjs 会扫描 index.html / app.js 里的内联调用做双向校验。 */
 Object.assign(window, {
   addNav, aixhubCheckNow, aixhubLoginFlow, aixhubLogout, autoFillNav, bulkNav, calcShares, calMove, clearAll,
-  clearDetSearch, closeSheet, commitNav, delNav, delProd, delTrade, dismissAlert, editProd,
-  exportJSON, go, importJSON, ledgermeCheckNow, ledgermeLoginFlow, ledgermeLogout, ocrPick, ocrShot, onDetSearch, onProdCodeInput, onTradeDateChange, openLinkAdd,
+  clearBdSearch, clearDetSearch, closeSheet, commitNav, delNav, delProd, delTrade, dismissAlert, editProd,
+  exportJSON, go, importJSON, ledgermeCheckNow, ledgermeLoginFlow, ledgermeLogout, ocrPick, ocrShot, onBdSearch, onDetSearch, onProdCodeInput, onTradeDateChange, openLinkAdd,
   openNav, openProd, openProdDetail, openSync, openTrade, pickDay, pickProduct, previewLink, qrPick, qrShot,
   queryProduct, refreshNav, renderPick, renderTradeForm2, resetManualFetch, saveFromLink,
-  saveProduct, saveSyncCfg, saveTrade, setDetInst, setDetSort, setDetTab, setGroup, setProdOv,
+  saveProduct, saveSyncCfg, saveTrade, setBdInst, setBdSort, setDetInst, setDetSort, setDetTab, setGroup, setProdOv,
   setProdRange, setRange, syncPull, syncPush, toggleHide, toggleNotify, triggerFetch
 });
 

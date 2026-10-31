@@ -46,6 +46,25 @@ export const pct = (n) => (n * 100).toFixed(2) + "%";
 /** @param {number} n */
 export const cls = (n) => (n > 0 ? "up" : n < 0 ? "down" : "muted");
 
+/** 「隐藏」打开时统一显示的占位符 */
+export const MASK = "****";
+
+/**
+ * 「隐藏」开关的唯一出口（v45）。
+ * 以前各处手写 `hideAmount ? "****" : money(x)`，写漏一处就等于没遮 ——
+ * 台账页的日收益大字、日历格子里的当日收益、明细里的当日盈亏都曾这么漏出去。
+ * 渲染函数里所有金额 / 收益类数值都必须经过这里，app_core 有一条门禁盯着。
+ * @param {boolean} hide @param {string} text 已格式化好的显示文本
+ */
+export const maskMoney = (hide, text) => (hide ? MASK : text);
+
+/**
+ * 配套的颜色出口：隐藏时把涨跌色一起收掉。
+ * 只遮数字不遮颜色等于泄露正负 —— 一片绿照样能看出「今天赚了」。
+ * @param {boolean} hide @param {number} n
+ */
+export const maskTone = (hide, n) => (hide ? "muted" : cls(n));
+
 export const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 /** @param {unknown} s */
