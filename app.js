@@ -24,6 +24,7 @@ import { configureCalendar, suggestTradeDates, tradeDaysBetween } from "./js/dom
 import { normTomb, mergeTombs, purgeTombs, applyTombs as applyTombsIn } from "./js/domain/tomb.js";
 import { mergeForPush } from "./js/domain/sync.js";
 import { syncBadge, syncLine } from "./js/domain/syncstatus.js";
+import { readRelease, updateVerdict } from "./js/domain/update.js";
 import { BOARD_COLS, NO_INST, instKey, instLabel, boardFilter, boardInstChips,
   monthZeroDays, boardSort } from "./js/domain/board.js";
 
@@ -39,7 +40,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v46";
+const APP_VER = "v47";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -2319,6 +2320,11 @@ function openSync() {
     : `需要两项：<code>Contents: Read and write</code>（读写数据）+ <code>Actions: Read and write</code>（用「⚡ 立即抓取」触发云端任务；只给 Contents 会 403）。`;
   /* 预填值没被改过就别展开高级，首次配置只剩 Token 一格 */
   const advOpen = (SYNC.owner !== "glorywork" || SYNC.repo !== "licai-data" || SYNC.path !== "licai-data.json");
+  /* 「App 更新」只在有本机更新桥的壳里出现：判的是 nativeUpdateAvailable() 而不是
+     inApp —— 线上优先之后跑的是页面上的代码、装的是本机那个壳，两者版本可以错开
+     （Java 只挡住「比本壳更老的代码」，新代码允许跑在旧壳上）。所以桥的存在与否
+     只能运行时探测，探不到就别留一个点了没反应的按钮。 */
+  const canUpd = nativeUpdateAvailable();
   openSheet(`<div class="sheet-t"><h3>数据同步设置</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="note b" style="margin-bottom:12px">
       数据存到你<b>自己的 GitHub 私有仓库</b>的一个 JSON 文件里，多设备打开即共享。
@@ -2346,8 +2352,11 @@ function openSync() {
     <div class="field" style="margin-top:10px"><label>手动抓取结果</label>
       <div id="manFetchBox">${manStatusHtml()}</div>
     </div>`}
+    ${canUpd ? `<div class="field" style="margin-top:12px"><label>App 更新（本机壳 + 线上页面）</label>
+      <div id="updBox"></div></div>` : ""}
     <div id="syncMsg" style="margin-top:10px"></div>`);
   if (!inApp) ensureManualPolling();
+  if (canUpd) renderUpdBox();
 }
 function saveSyncCfg(test) {
   SYNC.owner = ($("sOwner").value || "").trim();
@@ -3178,6 +3187,166 @@ function flushDirty() {
 }
 
 /* ============================================================
+   App 自更新（v47）：判断在 JS，取包与拉起安装器在 Java
+   ------------------------------------------------------------
+   为什么要它：APK 只发在私有仓 licai-data 的 Release 上，浏览器下载必然要登录
+   GitHub。而那枚 fine-grained Token 本来就在 App 里（数据同步用的就是它），
+   所以「检查更新 → 下载 → 安装」整条链路在 App 内闭环，网页版一律不出现这块。
+   公开仓原来的 apk-latest Release 已同步删除：包不再对公网可下载。
+
+   职责切分：读 release JSON、比版本、给结论是纯逻辑，放 js/domain/update.js
+   （有测试）；带凭据的二进制流和 REQUEST_INSTALL_PACKAGES 只能由 Java 做。
+   下载 URL 用的是 API 的 asset.url + Token，不是 browser_download_url ——
+   后者需要登录后的 Cookie，正是我们要绕开的那件事。
+   ============================================================ */
+const LS_UPD = "licai.upd";
+/* 只缓存「上次查到的结论」，让设置页离线也能显示一行；包地址不进 localStorage
+   （API 直链每次都要带 Token 现取，存了反而容易拿过期链接去下） */
+let UPD = { at: 0, state: "", version: "", size: 0, text: "" };
+let _updInfo = null, _updChecking = false, _updBusy = false;
+const _updDone = {};
+try { const s = localStorage.getItem(LS_UPD); if (s) UPD = Object.assign(UPD, JSON.parse(s)); } catch (e) { }
+function saveUpd() { try { localStorage.setItem(LS_UPD, JSON.stringify(UPD)); } catch (e) { } }
+
+function nativeUpdateAvailable() {
+  try { return !!(window.NativeUpdate && typeof window.NativeUpdate.version === "function"); }
+  catch (e) { return false; }
+}
+/* 本机 APK 的 versionName（如 "1.0.205"）；拿不到就返回空串，让判断走 unknown 分支 */
+function localApkVersion() {
+  if (!nativeUpdateAvailable()) return "";
+  try { return String(window.NativeUpdate.version() || ""); } catch (e) { return ""; }
+}
+window.__updDone = function (id, res) {
+  const f = _updDone[id]; if (!f) return;
+  delete _updDone[id]; f(res);
+};
+/* 下载进度：Java 边写文件边回调（不写 id —— 进度只影响显示，不该和结果抢队列） */
+window.__updProg = function (loaded, total) {
+  const box = $("updBox"); if (!box) return;
+  const pctTxt = total ? Math.min(100, Math.round(loaded / total * 100)) + "%" : "已下 " + Math.round(loaded / 1048576 * 10) / 10 + " MB";
+  box.innerHTML = `<div class="note b">正在下载更新包… <b>${esc(pctTxt)}</b><br><span class="muted">下载完会自动弹出系统安装页。</span></div>`;
+};
+function updBridge(method, args, label, ms) {
+  return new Promise(resolve => {
+    if (!nativeUpdateAvailable()) return resolve({ ok: false, message: (label || "更新") + "只在 Android App 内可用" });
+    const id = "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    let settled = false;
+    const finish = r => { if (settled) return; settled = true; delete _updDone[id]; resolve(r || { ok: false }); };
+    const timer = setTimeout(() => finish({ ok: false, message: (label || "更新") + "超时，请重试" }), ms || 30000);
+    _updDone[id] = r => { clearTimeout(timer); finish(r); };
+    try { window.NativeUpdate[method].apply(window.NativeUpdate, [id].concat(args)); }
+    catch (e) { clearTimeout(timer); finish({ ok: false, message: String(e) }); }
+  });
+}
+/* 能不能拉起安装页（Android 8+ 的「安装未知应用」授权） */
+function nativeCanInstall() {
+  if (!nativeUpdateAvailable()) return true;   /* 网页版走不到这里 */
+  try { return !!window.NativeUpdate.canInstall(); } catch (e) { return false; }
+}
+function openUnknownSources() {
+  try { window.NativeUpdate.openInstallSettings(); toast("请在列表里找到「理财台账」→ 允许安装未知应用", 5200); }
+  catch (e) { toast("打不开系统设置：" + String(e).slice(0, 80), 5200); }
+}
+/* 读私有仓最新的 Release。ghReq 复用同一条带 Token 的请求通道，
+   404（仓库还没发过 release）单独收成一句人话，别把 HTTP 原文甩给用户 */
+async function latestRelease(owner, repo) {
+  try {
+    const j = await ghReq("GET", GH + "/repos/" + encodeURIComponent(owner) + "/" + encodeURIComponent(repo) + "/releases/latest");
+    return readRelease(j);
+  } catch (e) {
+    const m = String(e && e.message || e);
+    if (/HTTP 404/.test(m)) return { ok: false, error: "仓库 " + owner + "/" + repo + " 还没有正式版 Release" };
+    if (/HTTP 401/.test(m)) return { ok: false, error: "Token 无效或已被吊销" };
+    if (/HTTP 403/.test(m)) return { ok: false, error: "Token 没有这个仓库的 Contents 读取权限" };
+    return { ok: false, error: m.slice(0, 120) };
+  }
+}
+async function checkApkUpdate(manual) {
+  if (!nativeUpdateAvailable()) { if (manual) toast("更新检查只在 Android App 内提供"); return; }
+  if (!(SYNC.owner && SYNC.repo && SYNC.token)) { if (manual) toast("先在上面填好 GitHub Token 才能检查更新", 4600); return; }
+  if (_updChecking) return;
+  _updChecking = true;
+  if (manual) renderUpdBox("正在检查…");
+  let info, verdict;
+  try {
+    info = await latestRelease(SYNC.owner, SYNC.repo);
+    verdict = updateVerdict(localApkVersion(), info);
+  } catch (e) {
+    info = { ok: false };
+    verdict = updateVerdict(localApkVersion(), { ok: false, error: String(e && e.message || e).slice(0, 120) });
+  }
+  _updChecking = false;
+  _updInfo = info && info.ok ? info : null;
+  UPD = { at: Date.now(), state: verdict.state, version: verdict.version, size: verdict.size, text: verdict.text };
+  saveUpd();
+  renderUpdBox();
+  if (manual || verdict.state === "new") {
+    toast(verdict.state === "new" ? "有新包：" + verdict.version + "，在「数据同步」里更新" : verdict.text, 5200);
+  }
+  return verdict;
+}
+function applyApkUpdate() {
+  if (!_updInfo) { toast("先点一次「检查更新」拿包地址", 4200); return checkApkUpdate(true); }
+  if (!nativeCanInstall()) { toast("系统还没给「安装未知应用」权限，点下面的按钮去开启", 5600); renderUpdBox(); return; }
+  if (_updBusy) return;
+  _updBusy = true;
+  const total = _updInfo.size || 0;
+  const version = _updInfo.version, download = _updInfo.download;
+  const write = html => { const b = $("updBox"); if (b) b.innerHTML = html; };
+  /* 40MB 在移动网络下要走几分钟，弹层可能被用户关掉、甚至被 WebView 回收：
+     进度与结果都写向 updBox，但那个节点可能已经不在 —— write() 统一做判空。 */
+  write(`<div class="note b">正在下载 licai-ledger.apk…<br><span class="muted">约 ${(Math.round(total / 1048576 * 10) / 10) || "?"} MB，走的是带 Token 的 API 直链。</span></div>`);
+  updBridge("install", [download, SYNC.token], "下载", 600000).then(r => {
+    _updBusy = false;
+    if (r && r.ok) {
+      UPD = { at: Date.now(), state: "sent", version: version, size: total, text: "" };
+      saveUpd();
+      write(`<div class="note g">安装包已交给系统安装器（版本 ${esc(version)}）。<br>
+        <span class="muted">在安装页点「继续安装」即可，数据不会丢；同签名的包是覆盖安装。</span></div>`);
+      toast("请在系统安装页确认", 5200);
+    } else {
+      const msg = String((r && r.message) || "未知错误");
+      write(`<div class="note r">下载/安装失败：${esc(msg.slice(0, 160))}<br>
+        <span class="muted">常见原因：Token 权限不足、网络中断、或 release 里的包还没上传完。</span></div>
+        <div class="row-btn" style="margin-top:10px"><button class="btn gh" style="flex:1" onclick="checkApkUpdate(true)">重新检查</button></div>`);
+      toast("更新失败：" + msg.slice(0, 90), 5600);
+    }
+  });
+}
+/* 设置弹层里那行「App 更新」：只在 App 内出现，网页版整块不渲染 */
+function renderUpdBox(msg) {
+  const box = $("updBox"); if (!box) return;
+  const cur = localApkVersion();
+  if (msg) { box.innerHTML = `<div class="note b">${esc(msg)}</div>`; return; }
+  const st = UPD.state;
+  let line;
+  if (st === "new") line = `<div class="note r">${esc(UPD.text)}<br><span class="muted">更新是在本机覆盖安装，台账数据不会被动。</span></div>`;
+  else if (st === "sent") line = `<div class="note g">已把 ${esc(UPD.version || "新包")} 交给系统安装器。</div>`;
+  else if (st === "latest") line = `<div class="note g">${esc(UPD.text)}</div>`;
+  else if (st === "unknown") line = `<div class="note">${esc(UPD.text || "还没检查过更新")}</div>`;
+  else line = `<div class="note">还没检查过更新${cur ? "（本机 " + esc(cur) + "）" : ""}。包只发在你自己的私有仓，需要 Token 才能取。</div>`;
+  const when = UPD.at ? `<div class="muted" style="margin-top:6px;font-size:12px">上次检查：${esc(stampOf(UPD.at))}</div>` : "";
+  const perm = (st === "new" && !nativeCanInstall())
+    ? `<div class="note r" style="margin-top:8px">系统还没允许本应用安装未知应用。<button class="btn gh" style="margin-top:6px;width:100%" onclick="openUnknownSources()">去系统设置开启</button></div>` : "";
+  box.innerHTML = `${line}${when}${perm}
+    <div class="row-btn" style="margin-top:10px">
+      <button class="btn gh" style="flex:1" onclick="checkApkUpdate(true)">检查更新</button>
+      ${st === "new" ? `<button class="btn pri" style="flex:1" onclick="applyApkUpdate()">下载并安装</button>` : ""}
+    </div>`;
+}
+/* 静默自动检查：每台设备 12 小时最多一次，且只在 App 内。
+   为什么不每次打开都查：包地址在私有仓，一次检查 = 一次带 Token 的 API 调用，
+   而新版本一周也未必有一次；用户真要点的是「有新包」那个按钮，不是每次都问网络。 */
+function maybeAutoUpdCheck() {
+  if (!nativeUpdateAvailable()) return;
+  if (!(SYNC.owner && SYNC.repo && SYNC.token)) return;
+  if (UPD.state === "sent") return;   /* 装着新包的路上，别再提示 */
+  if (Date.now() - (Number(UPD.at) || 0) < 12 * 3600 * 1000) return;
+  setTimeout(() => { checkApkUpdate(false); }, 3000);
+}
+
+/* ============================================================
    提醒：新净值通知 + 抓取异常告警
    ------------------------------------------------------------
    为什么没有「真正的后台推送」：
@@ -3398,10 +3567,10 @@ function clearAll() {
    ⚠️ 新增内联 handler 时必须同步加进这个清单 ——
    tests/handlers.test.mjs 会扫描 index.html / app.js 里的内联调用做双向校验。 */
 Object.assign(window, {
-  addNav, aixhubCheckNow, aixhubLoginFlow, aixhubLogout, autoFillNav, bulkNav, calcShares, calMove, clearAll,
+  addNav, aixhubCheckNow, aixhubLoginFlow, aixhubLogout, applyApkUpdate, autoFillNav, bulkNav, calcShares, calMove, checkApkUpdate, clearAll,
   clearBdSearch, clearDetSearch, closeSheet, commitNav, delNav, delProd, delTrade, dismissAlert, editProd,
   exportJSON, go, importJSON, ledgermeCheckNow, ledgermeLoginFlow, ledgermeLogout, ocrPick, ocrShot, onBdSearch, onDetSearch, onProdCodeInput, onTradeDateChange, openLinkAdd,
-  openNav, openProd, openProdDetail, openSync, openTrade, pickDay, pickProduct, previewLink, qrPick, qrShot,
+  openNav, openProd, openProdDetail, openSync, openTrade, openUnknownSources, pickDay, pickProduct, previewLink, qrPick, qrShot,
   queryProduct, refreshNav, renderPick, renderTradeForm2, resetManualFetch, saveFromLink,
   saveProduct, saveSyncCfg, saveTrade, setBdInst, setBdSort, setDetInst, setDetSort, setDetTab, setGroup, setProdOv,
   setProdRange, setRange, syncPull, syncPush, toggleHide, toggleNotify, triggerFetch
@@ -3420,6 +3589,8 @@ Object.assign(window, {
   /* 上次手动抓取若在系统回收时还没跑完，启动后接着追踪（12 分钟上限自动兜底） */
   ensureManualPolling();
   const pullP = (SYNC.owner && SYNC.repo && SYNC.token) ? syncPull(false) : Promise.resolve();
+  /* App 内每天几次地看一眼私有仓有没有新包（12 小时节流，见 maybeAutoUpdCheck） */
+  maybeAutoUpdCheck();
   window.addEventListener("online", () => {
     if (SYNC.owner) syncPull(false);
     if (nativeFetchAvailable()) { try { window.__nativeAutoFetch(); } catch (e) { } }

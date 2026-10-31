@@ -47,4 +47,4 @@ jobs:
       # 产品收益表的筛选与排序口径（v45）、同步状态的显示口径（v46：
       # 有改动待推时绝不许显示「已同步」——那等于放用户去卸载）
       - name: 纯逻辑测试
-        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs tests/calendar.test.mjs tests/tomb.test.mjs tests/sync_merge.test.mjs tests/board.test.mjs tests/syncstatus.test.mjs
+        run: node --test tests/app_core.test.mjs tests/handlers.test.mjs tests/calendar.test.mjs tests/tomb.test.mjs tests/sync_merge.test.mjs tests/board.test.mjs tests/syncstatus.test.mjs tests/update.test.mjs
