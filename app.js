@@ -23,6 +23,7 @@ import { ocrNavLines } from "./js/domain/ocr.js";
 import { configureCalendar, suggestTradeDates, tradeDaysBetween } from "./js/domain/calendar.js";
 import { normTomb, mergeTombs, purgeTombs, applyTombs as applyTombsIn } from "./js/domain/tomb.js";
 import { mergeForPush } from "./js/domain/sync.js";
+import { syncBadge, syncLine } from "./js/domain/syncstatus.js";
 import { BOARD_COLS, NO_INST, instKey, instLabel, boardFilter, boardInstChips,
   monthZeroDays, boardSort } from "./js/domain/board.js";
 
@@ -38,7 +39,7 @@ const LS_ALERT = "licai_ledger_alert_v1";
 /* 前端版本号：与 sw.js 的 CACHE 后缀必须一致（scripts/check-version.sh 会校验）。
    升版时两处一起改：这里 + sw.js 的 CACHE。
    页面上会显示出来 —— 之前「推了代码但页面没变」排查起来全靠猜，有了它一眼可判。 */
-const APP_VER = "v45";
+const APP_VER = "v46";
 const NAV_API = "https://xinxipilu.chinawealth.com.cn/lcxp-platService";
 const DETAIL_PAGE = "https://xinxipilu.chinawealth.com.cn/queryMenu/prodType/prodTypeDetail?prodRegCode=";
 
@@ -95,7 +96,10 @@ function navSrcText(info) {
  }
 */
 let DATA = { products: [], trades: [], settings: { hideAmount: false } };
-let SYNC = { owner: "", repo: "", path: "licai-data.json", token: "", sha: "", auto: true };
+/* owner / repo 预填本台账的默认仓库（v46）：这是个人台账，不是给别人装的产品，
+   首次配置真正缺的只有 Token 一格。换仓库 / 换文件路径的口子留在同步面板的
+   「高级」里，没有删。 */
+let SYNC = { owner: "glorywork", repo: "licai-data", path: "licai-data.json", token: "", sha: "", auto: true };
 /* 提醒状态（本机）：on = 用户是否开启了系统通知；lastCheck = 上次比对云端的时间戳 */
 let NOTIFY = { on: false, lastCheck: 0 };
 /* 用户已忽略的抓取告警签名（按「失败集合」生成，集合一变就重新提示） */
@@ -125,7 +129,26 @@ let _POS_VER = 0;
    静默拉取（启动 / 回前台 / online / 后台轮询）看到 dirty 会先推后拉，
    避免云端旧数据把本地还没推上去的编辑覆盖丢掉。 */
 let DIRTY = false;
-function dirtyPersist() { try { localStorage.setItem(LS_DATA + ".dirty", DIRTY ? "1" : "0"); } catch (e) { } }
+/* v46：DIRTY 从「一个没人看的布尔」升级成「能说话的状态」。
+   dirtyAt（最后编辑）、pushAt（最后一次成功推送）、err（上次失败原因）、
+   nextAt / retryN（退避重试排到哪一步）一起存本机，顶栏胶囊与设置页那句说明
+   全由它们算出来 —— 显示口径是纯函数，在 js/domain/syncstatus.js 里有测试。
+   布尔 DIRTY 保留：既有五处判断读它比 `dirtyAt > 0` 直白，而且旧版本写的
+   ".dirty" 值（"1"/"0"）要接着认得住。 */
+let SYNC_ST = { dirtyAt: 0, pushAt: 0, err: "", nextAt: 0, retryN: 0 };
+const LS_ST = LS_SYNC + ".st";
+function stPersist() {
+  try { localStorage.setItem(LS_ST, JSON.stringify(SYNC_ST)); } catch (e) { }
+}
+function dirtyPersist() {
+  try { localStorage.setItem(LS_DATA + ".dirty", DIRTY ? "1" : "0"); } catch (e) { }
+  if (DIRTY) SYNC_ST.dirtyAt = Date.now();     /* 「最后编辑 X 前」按最近一次改动算 */
+  else { SYNC_ST.dirtyAt = 0; SYNC_ST.err = ""; SYNC_ST.nextAt = 0; SYNC_ST.retryN = 0; }
+  stPersist();
+  /* 状态一变就重画顶栏胶囊：dirty 正是「用户刚敲完一笔」的那一刻，让他立刻看见
+     「待推送」比 1.5 秒后自动推完才看见「已同步」更诚实，也更像一个活的东西。 */
+  syncStateView();
+}
 function saveLocal() {
   _POS_VER++; DIRTY = true; dirtyPersist();
   try {
@@ -144,8 +167,21 @@ function loadLocal() {
     const s = localStorage.getItem(LS_DATA);
     if (s) { const o = JSON.parse(s); DATA = Object.assign({ products: [], trades: [], settings: {} }, o); }
     const y = localStorage.getItem(LS_SYNC);
-    if (y) SYNC = Object.assign(SYNC, JSON.parse(y));
+    if (y) {
+      const o = JSON.parse(y);
+      /* v46：owner/repo/path 现在有预填默认值，存过的空串不能把它抹掉
+         （早期只要点过一次「保存配置」而仓库留空，localStorage 里就是三个空串） */
+      for (const k of Object.keys(o)) {
+        if (!o[k] && (k === "owner" || k === "repo" || k === "path")) continue;
+        SYNC[k] = o[k];
+      }
+    }
     DIRTY = localStorage.getItem(LS_DATA + ".dirty") === "1";   /* v32 P0-2 */
+    try { SYNC_ST = Object.assign(SYNC_ST, JSON.parse(localStorage.getItem(LS_ST) || "{}")); } catch (e) { }
+    /* 老数据只有布尔、没有时间点：只能从「看见它还没推」的这一刻算起，
+       否则界面会显示「最后编辑 5900 天前」这种荒唐话。 */
+    if (DIRTY && !SYNC_ST.dirtyAt) SYNC_ST.dirtyAt = Date.now();
+    if (!DIRTY) { SYNC_ST.dirtyAt = 0; SYNC_ST.err = ""; SYNC_ST.nextAt = 0; SYNC_ST.retryN = 0; }
   } catch (e) { console.warn(e); }
 }
 function saveSync() {
@@ -983,16 +1019,28 @@ function clearBdSearch() {
 }
 
 /* ---------- 设置页同步状态 ---------- */
+/* 顶栏胶囊：文案口径在 js/domain/syncstatus.js（纯函数、有测试），这里只负责写字。
+   每次推送成功 / 失败 / 重试排期变化都要调一次，别再学 v45 那样在成功那一刻
+   硬写「已同步」三个字 —— 那句话曾经既不反映 DIRTY 也不反映时间。 */
+function syncStateView() {
+  const b = syncBadge(Object.assign({ cfgOk: !!(SYNC.owner && SYNC.repo && SYNC.token) }, SYNC_ST));
+  const e = $("syncState");
+  if (e) { e.textContent = b.text; e.className = "sync-state" + (b.cls ? " " + b.cls : ""); }
+  return b;
+}
 function renderSet() {
-  const ok = SYNC.owner && SYNC.repo && SYNC.token;
+  const ok = !!(SYNC.owner && SYNC.repo && SYNC.token);
+  const st = Object.assign({ cfgOk: ok }, SYNC_ST);
+  const b = syncBadge(st);
+  const cls = b.cls === "ok" ? "note g" : b.cls === "bad" ? "note r" : b.cls === "warn" ? "note" : "note b";
   $("setSyncBox").innerHTML = ok
-    ? `<div class="note g">已连接：<b>${esc(SYNC.owner)}/${esc(SYNC.repo)}</b><br>数据文件：${esc(SYNC.path)}${SYNC.sha ? "<br>远端版本：" + esc(SYNC.sha.slice(0, 7)) : ""}</div>
+    ? `<div class="${cls}">${esc(syncLine(st))}<br>仓库：<b>${esc(SYNC.owner)}/${esc(SYNC.repo)}</b> · 数据文件：${esc(SYNC.path)}${SYNC.sha ? " · 远端版本 " + esc(SYNC.sha.slice(0, 7)) : ""}</div>
        <div class="row-btn" style="margin-top:10px">
          <button class="btn gh" style="flex:1" onclick="syncPull(true)">↓ 从云端拉取</button>
          <button class="btn pri" style="flex:1" onclick="syncPush(true)">↑ 推送到云端</button>
        </div>`
-    : `<div class="note">尚未连接云端。配置后即可多设备共享同一份台账数据。</div>`;
-  $("syncState").textContent = ok ? "已连接" : "未连接";
+    : `<div class="note b">尚未连接云端：填好 Token 就能多设备共享同一份台账。仓库与数据文件已预填，改它们请在弹层「高级」里。</div>`;
+  syncStateView();
   renderAixhub();
   renderLedgerme();
   renderNotify();
@@ -2262,17 +2310,28 @@ function refreshNav() {
    ============================================================ */
 const GH = "https://api.github.com";
 function openSync() {
+  /* Token 需要的权限按运行环境分两种说法：App 里「立即抓取」是本机 CPython 直接跑
+     （见 triggerFetch 开头的 nativeFetchAvailable 分支），根本不派发 Actions，
+     再让用户去勾 Actions:write 就是白要权限；网页端才需要它触发 update_nav.yml。 */
+  const inApp = nativeFetchAvailable();
+  const scope = inApp
+    ? `本机只需一项：<code>Contents: Read and write</code>。净值在手机上本地抓，不派发云端任务，<b>不用给 Actions 权限</b>。`
+    : `需要两项：<code>Contents: Read and write</code>（读写数据）+ <code>Actions: Read and write</code>（用「⚡ 立即抓取」触发云端任务；只给 Contents 会 403）。`;
+  /* 预填值没被改过就别展开高级，首次配置只剩 Token 一格 */
+  const advOpen = (SYNC.owner !== "glorywork" || SYNC.repo !== "licai-data" || SYNC.path !== "licai-data.json");
   openSheet(`<div class="sheet-t"><h3>数据同步设置</h3><button class="x" onclick="closeSheet()">✕</button></div>
     <div class="note b" style="margin-bottom:12px">
       数据存到你<b>自己的 GitHub 私有仓库</b>的一个 JSON 文件里，多设备打开即共享。
-      请用<b>细粒度 Token</b>（Fine-grained PAT），仅授权该仓库的 <code>Contents: Read and write</code>。
+      请用<b>细粒度 Token</b>（Fine-grained PAT），<b>只授权那一个仓库</b>，权限：${scope}
     </div>
-    <div class="field"><label>GitHub 用户名</label><input id="sOwner" value="${esc(SYNC.owner)}" placeholder="如 zhangsan"></div>
-    <div class="field"><label>仓库名</label><input id="sRepo" value="${esc(SYNC.repo)}" placeholder="如 licai-data"></div>
-    <div class="field"><label>数据文件路径</label><input id="sPath" value="${esc(SYNC.path)}" placeholder="licai-data.json"></div>
     <div class="field"><label>细粒度 Token</label><input id="sToken" type="password" value="${esc(SYNC.token)}" placeholder="github_pat_..."></div>
-    <div class="note">Token 只保存在本机浏览器，不会上传到任何第三方。若泄露可随时在 GitHub 吊销。<br>
-      需要两项仓库权限：<code>Contents: Read and write</code>（读写数据）+ <code>Actions: Read and write</code>（用「⚡ 立即抓取」手动触发云端任务）。</div>
+    <details class="adv"${advOpen ? " open" : ""}><summary>高级：仓库 / 数据文件路径</summary>
+      <div class="field"><label>GitHub 用户名</label><input id="sOwner" value="${esc(SYNC.owner)}" placeholder="如 zhangsan"></div>
+      <div class="field"><label>仓库名</label><input id="sRepo" value="${esc(SYNC.repo)}" placeholder="如 licai-data"></div>
+      <div class="field"><label>数据文件路径</label><input id="sPath" value="${esc(SYNC.path)}" placeholder="licai-data.json"></div>
+    </details>
+    <div class="note">Token 只保存在本机，不会上传到任何第三方；若泄露可随时在 GitHub 上吊销。<br>
+      改动会在一笔编辑后 1.5 秒自动推上去，顶栏那个胶囊说的就是「推上去没有」。</div>
     <div class="row-btn" style="margin-top:14px">
       <button class="btn gh" style="flex:1" onclick="saveSyncCfg()">保存配置</button>
       <button class="btn pri" style="flex:1" onclick="saveSyncCfg(true)">保存并测试</button>
@@ -2281,14 +2340,14 @@ function openSync() {
       <button class="btn gh" style="flex:1" onclick="syncPull(true)">↓ 拉取云端数据</button>
       <button class="btn pri" style="flex:1" onclick="syncPush(true)">↑ 推送本地数据</button>
     </div>
-    <div class="row-btn" style="margin-top:9px">
+    ${inApp ? "" : `<div class="row-btn" style="margin-top:9px">
       <button id="btnFetchNow" class="btn" style="flex:1" onclick="triggerFetch()">⚡ 立即抓取最新净值</button>
     </div>
     <div class="field" style="margin-top:10px"><label>手动抓取结果</label>
       <div id="manFetchBox">${manStatusHtml()}</div>
-    </div>
+    </div>`}
     <div id="syncMsg" style="margin-top:10px"></div>`);
-  ensureManualPolling();
+  if (!inApp) ensureManualPolling();
 }
 function saveSyncCfg(test) {
   SYNC.owner = ($("sOwner").value || "").trim();
@@ -2979,9 +3038,12 @@ async function syncPull(manual) {
     /* 云端数据同样要过一遍迁移：合并重复产品、搬迁销售代码。
        若发生变更则回写云端 —— 抓取脚本读到正确的产品代码后才会抓到净值。 */
     const migratedRemote = migrateData();
+    /* 「拉下来的就是云端现势，本机没有待推的改动」这句判断要放在重画之前：
+       saveLocal() 刚刚把 DIRTY 置成了 true（它不区分「用户改的」还是「拉回来的」），
+       先清再画，否则设置页会拿着「还没推上去」的状态渲染一次，跟顶栏胶囊当场打架。 */
+    if (!migratedRemote && _POS_VER === pullVer) { DIRTY = false; dirtyPersist(); }
     renderHome(); renderTrade(); renderProd(); renderSet();
     if (migratedRemote) { notifyMigrate(); autoPush(); }
-    else if (_POS_VER === pullVer) { DIRTY = false; dirtyPersist(); }   /* 拉下来的就是云端现势，本地没有未推送改动 */
     const after = navFingerprint();
     /* before.count 为 0 说明本机还没有任何净值（首次拉取 / 换设备），
        拿它当基准会算出「云端有 200 条新净值」这种荒唐提示，故跳过。 */
@@ -2994,7 +3056,14 @@ async function syncPull(manual) {
 }
 async function syncPush(manual) {
   if (!SYNC.owner || !SYNC.repo || !SYNC.token) { if (manual) toast("请先配置同步"); return; }
+  /* v46：一次只允许一发 PUT 在飞。autoPush 的 debounce、退避重试、拉取前的补推、
+     手动按钮四条路径都会调到这里；两发用同一个 sha 先后发出去，第二发必然 409 ——
+     与其把它当并发冲突重合并一遍，不如压根不让它们重叠。
+     在飞期间又改了数据就记一笔 _pushAgain，这发落地立刻补一发。 */
+  if (_pushing) { _pushAgain = true; return; }
+  _pushing = true;
   const body = { message: `update ledger ${new Date().toISOString().slice(0, 16)}` };
+  const url = () => `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`;
   try {
     /* 推之前先读一次远端。两个原因，都跟「整文件替换」有关：
        ① GitHub Contents PUT 是整文件替换：payload 里少一块，云端就少一块。远端现势
@@ -3004,14 +3073,14 @@ async function syncPush(manual) {
     /** @type {any} */
     let robj = {};
     try {
-      const cur = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`);
+      const cur = await ghReq("GET", url());
       if (cur && cur.sha) {
         body.sha = cur.sha;
         robj = JSON.parse(b64ToUtf8(cur.content)) || {};
       }
     } catch (e) { /* 读不到远端就按本地推，不阻断正常保存 */ }
     if (!body.sha) {
-      try { const info = await ghReq("GET", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`); body.sha = info.sha; } catch (e) { }
+      try { const info = await ghReq("GET", url()); body.sha = info.sha; } catch (e) { }
     }
     /* 别的设备删除过的东西：先并合墓碑并在本地执行，再随本次 payload 一起推回去。
        没有这一步，本机旧快照会把已删产品 / 交易 / 净值原样复活。 */
@@ -3024,26 +3093,55 @@ async function syncPush(manual) {
        合并规则（不改动 DATA、云端独有条目保留、净值只补日期、同日保留本地、
        墓碑有效期内不复活、settings 取更新的一份）全在 js/domain/sync.js 里，可测；
        这里只负责网络与 sha。 */
-    const { payload, stats } = mergeForPush(DATA, robj);
-    const _pushVer = _POS_VER;   /* payload 快照对应的数据版本（推送成功后据此决定是否清 dirty） */
-    if (stats.products || stats.trades)
-      console.info(`同步：本次推送保留了云端独有的 ${stats.products} 只产品 / ${stats.trades} 笔交易`);
-    body.content = utf8ToB64(JSON.stringify(payload, null, 1));
-    /* 只把合并后的两个抓取脚本字段留在本地，不整段覆盖 settings
-       （旧写法 DATA.settings = payload.settings 会用网络往返前的旧快照回写） */
-    DATA.settings = DATA.settings || {};
-    for (const k of ["lastNavSync", "lastFetch"])
-      if (payload.settings[k] !== undefined) DATA.settings[k] = payload.settings[k];
-    const res = await ghReq("PUT", `${GH}/repos/${SYNC.owner}/${SYNC.repo}/contents/${SYNC.path}`, body);
+    let res = null, pushVer = _POS_VER;
+    for (let attempt = 0; ; attempt++) {
+      const { payload, stats } = mergeForPush(DATA, robj);
+      pushVer = _POS_VER;   /* payload 快照对应的数据版本（成功后据此决定是否清 dirty） */
+      if (stats.products || stats.trades)
+        console.info(`同步：本次推送保留了云端独有的 ${stats.products} 只产品 / ${stats.trades} 笔交易`);
+      body.content = utf8ToB64(JSON.stringify(payload, null, 1));
+      /* 只把合并后的两个抓取脚本字段留在本地，不整段覆盖 settings
+         （旧写法 DATA.settings = payload.settings 会用网络往返前的旧快照回写） */
+      DATA.settings = DATA.settings || {};
+      for (const k of ["lastNavSync", "lastFetch"])
+        if (payload.settings[k] !== undefined) DATA.settings[k] = payload.settings[k];
+      try {
+        res = await ghReq("PUT", url(), body);
+        break;
+      } catch (e0) {
+        /* 409 / 422（sha 陈旧）＝读远端与 PUT 之间另一台设备提交了。合并是幂等的
+           （mergeForPush 每次都以本地为骨架把远端现势并进来），所以直接重读现势、
+           重跑一遍合并再发一次；只补这一发，再来就是和另一台设备对敲。 */
+        if (attempt >= 1 || !/409|422/.test(String(e0))) throw e0;
+        const cur2 = await ghReq("GET", url());
+        if (!cur2 || !cur2.sha) throw e0;
+        body.sha = cur2.sha;
+        robj = JSON.parse(b64ToUtf8(cur2.content)) || {};
+        if (robj.tomb) { mergeTombs(tombstones(), robj.tomb); applyTombs(DATA); }
+        console.info("同步：这发撞上并发提交（409/422），已重读云端现势并重跑合并");
+      }
+    }
     SYNC.sha = res && res.content ? res.content.sha : ""; saveSync();
+    /* 成功：排期与错误一起清零，退避从头算 */
+    clearTimeout(_retryTimer); clearTimeout(_pushTimer);
+    const wasErr = !!SYNC_ST.err;
+    SYNC_ST.pushAt = Date.now(); SYNC_ST.err = ""; SYNC_ST.nextAt = 0; SYNC_ST.retryN = 0;
     /* 推送成功：payload 生成后没有新的本地改动才清 dirty（有的话说明网络期间又编辑了，
        新一轮 autoPush 会接着推） */
-    if (_pushVer === _POS_VER) { DIRTY = false; dirtyPersist(); }
-    $("syncState").textContent = "已同步";
+    if (pushVer === _POS_VER) { DIRTY = false; dirtyPersist(); } else { stPersist(); }
+    /* 成功也要重画设置页：那里那句「还没推上去」如果只在 syncStateView 里更新，
+       用户盯着设置页就会看到胶囊说「已同步」、下面一段还写着没推上去。 */
+    renderSet();
     if (manual) toast("已推送到云端");
+    else if (wasErr) toast("已补推到云端");   /* 之前失败过（离线重试 / 409）时给一句准话 */
   } catch (e) {
-    if (manual) toast("推送失败：" + String(e).slice(0, 90), 3200);
+    SYNC_ST.err = String((e && e.message) || e).slice(0, 90);
+    scheduleRetry();   /* 内部会 renderSet，胶囊与说明一起换 */
+    if (manual) toast("推送失败：" + SYNC_ST.err, 3200);
     console.warn(e);
+  } finally {
+    _pushing = false;
+    if (_pushAgain) { _pushAgain = false; syncPush(false); }
   }
 }
 /* 自动推送（静默，失败不打扰） */
@@ -3052,6 +3150,31 @@ function autoPush() {
   if (!(SYNC.owner && SYNC.repo && SYNC.token)) return;
   clearTimeout(_pushTimer);
   _pushTimer = setTimeout(() => syncPush(false), 1500);
+}
+/* ---------- 失败后的兜底（v46） ----------
+   v45 只有「下次编辑再 debounce 一发」，所以最容易滞留 dirty 的组合就是它最容易
+   出事的组合：离线改完 → 直接杀 App。现在补三层：
+     · 失败退避重试 3s / 15s / 60s 各一发，用完就明说（状态文案由 syncLine 给）；
+       为什么只三发：推送失败无非离线与 Token 失效，前者由 online / 切前台兜住，
+       后者再多重试也只是给 GitHub 刷 401；
+     · flushDirty：切回前台时显式补推（旧代码只调 checkCloudUpdate，而它第一行
+       `if (!NOTIFY.on) return` 就把没开通知的设备全挡在外面，云端 sha 没变时也不推）；
+     · 切到后台时抢一发：WebView 随时可能被回收，抢到的就是不掉的那笔。 */
+const PUSH_BACKOFF = [3000, 15000, 60000];
+let _retryTimer = 0, _pushing = false, _pushAgain = false;
+function scheduleRetry() {
+  clearTimeout(_retryTimer);
+  if (!DIRTY || SYNC_ST.retryN >= PUSH_BACKOFF.length) { SYNC_ST.nextAt = 0; stPersist(); renderSet(); return; }
+  const wait = PUSH_BACKOFF[SYNC_ST.retryN];
+  SYNC_ST.retryN++;
+  SYNC_ST.nextAt = Date.now() + wait;
+  stPersist(); renderSet();
+  _retryTimer = setTimeout(() => { SYNC_ST.nextAt = 0; syncPush(false); }, wait);
+}
+function flushDirty() {
+  if (!DIRTY) return Promise.resolve();
+  if (!(SYNC.owner && SYNC.repo && SYNC.token)) return Promise.resolve();
+  return syncPush(false);
 }
 
 /* ============================================================
@@ -3321,11 +3444,21 @@ Object.assign(window, {
   setInterval(checkCloudUpdate, 60 * 60000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
+      /* v46：切回前台先补推本机改动，再核对云端。顺序很重要 ——
+         checkCloudUpdate 在没开系统通知时第一行就 return，指望它兜 dirty 是兜不住的。 */
+      flushDirty();
       checkCloudUpdate(); renderAlert(); renderNotify();
       /* App 回到前台：立刻按节流核对一次净值（切后台期间可能正好披露了新一天） */
       if (nativeFetchAvailable()) { try { window.__nativeAutoFetch(); } catch (e) { } }
+    } else if (DIRTY) {
+      /* 正要进后台：抢一发。WebView 可能在后台被回收，这一发抢到的就是不掉的那笔。
+         不 await —— 页面已经看不见了，成功与否由顶栏胶囊下次显示时说话。 */
+      syncPush(false);
     }
   });
+  /* 胶囊上的「40 秒前 / 5 分前」是算出来的，不是事件驱动的：没有新事件时它也会旧，
+     所以每分钟重画一次（纯本地，零网络请求）。 */
+  setInterval(syncStateView, 60000);
   /* 注册 Service Worker（仅 https / localhost 生效，file:// 下自动跳过）
      SW 是「外壳缓存优先」，新版本必须等新 SW 装上并接管才生效 ——
      否则用户会一直看到旧的 index.html / app.js，表现为「推了代码但页面没变」。

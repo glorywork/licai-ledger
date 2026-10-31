@@ -34,6 +34,16 @@ body{
 .topbar .logo{width:30px;height:30px;border-radius:9px;background:rgba(255,255,255,.22);display:grid;place-items:center;font-size:15px}
 .topbar h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px;flex:1}
 .topbar .sync-state{font-size:11px;padding:4px 9px;border-radius:20px;background:rgba(255,255,255,.2);white-space:nowrap;cursor:pointer}
+/* 同步状态胶囊（v46）：warn=本机有改动待推，bad=推不上去，ok=已推上。
+   默认那档（未连接 / 已连接但没推过）保持半透明白，不该比真消息更抢眼。 */
+.topbar .sync-state.warn{background:#ffd08a;color:#5a3600}
+.topbar .sync-state.bad{background:#ffb3b3;color:#7a1414}
+.topbar .sync-state.ok{background:#9fe3c2;color:#0b4d33}
+details.adv{margin:2px 0 10px}
+details.adv>summary{cursor:pointer;font-size:11.5px;color:var(--ink3);padding:4px 0;list-style:none}
+details.adv>summary::-webkit-details-marker{display:none}
+details.adv>summary::before{content:"▸ ";}
+details.adv[open]>summary::before{content:"▾ ";}
 /* ---------- 卡片 ---------- */
 .card{background:var(--card);border-radius:var(--r);box-shadow:var(--sh);padding:16px;margin-bottom:14px}
 .card-t{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
@@ -233,6 +243,7 @@ body{
 .note{background:#fff8e9;border:1px solid #ffe6b3;border-radius:11px;padding:10px 12px;font-size:11.5px;color:#8a6300;line-height:1.6}
 .note.b{background:#eef0ff;border-color:#dfe2ff;color:#4b4bb0}
 .note.g{background:#e9f7f1;border-color:#c8ecdc;color:#0d7a52}
+.note.r{background:#fdeeee;border-color:#f3cfcf;color:#8a1f1f}
 .empty{text-align:center;color:var(--ink3);font-size:12.5px;padding:26px 0}
 .toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(20px);background:rgba(28,32,51,.94);color:#fff;padding:11px 18px;border-radius:24px;font-size:13px;z-index:200;opacity:0;transition:.25s;pointer-events:none;max-width:86%;text-align:center}
 .toast.show{opacity:1;transform:translateX(-50%)}
